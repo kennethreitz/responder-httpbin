@@ -1,6 +1,6 @@
 version: '2'
 services:
-    httpbin:
+    responder-httpbin:
       build: '.'
       ports:
         - '80:80'

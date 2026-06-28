@@ -1,1 +1,1 @@
-web: gunicorn httpbin:app -k gevent
+web: granian --interface asgi --host 0.0.0.0 --port $PORT httpbin:api

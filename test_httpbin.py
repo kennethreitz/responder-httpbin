@@ -1,17 +1,24 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
+"""responder-httpbin test suite.
+
+Ported from the original Flask test_client-based tests to responder's built-in
+httpx test client (Starlette TestClient). The client uses ``base_url`` of
+``http://localhost`` so request URLs / Host headers match the original
+assertions, and ``follow_redirects=False`` to mirror the Flask test client.
+"""
 import os
 import base64
 import unittest
 import contextlib
-import six
 import json
-from werkzeug.http import parse_dict_header
+from io import BytesIO
 from hashlib import md5, sha256, sha512
-from six import BytesIO
+
+from starlette.testclient import TestClient
 
 import httpbin
-from httpbin.helpers import parse_multi_value_header
+from httpbin.helpers import parse_multi_value_header, parse_dict_header
 
 
 @contextlib.contextmanager
@@ -31,11 +38,11 @@ def _setenv(key, value):
         os.environ[key] = value
 
 
-
 def _string_to_base64(string):
     """Encodes string to utf-8 and then base64"""
     utf8_encoded = string.encode('utf-8')
     return base64.urlsafe_b64encode(utf8_encoded)
+
 
 def _hash(data, algorithm):
     """Encode binary data according to specified algorithm, use MD5 by default"""
@@ -46,21 +53,11 @@ def _hash(data, algorithm):
     else:
         return md5(data).hexdigest()
 
+
 def _make_digest_auth_header(username, password, method, uri, nonce,
                              realm=None, opaque=None, algorithm=None,
                              qop=None, cnonce=None, nc=None, body=None):
-    """Compile a digest authentication header string.
-
-    Arguments:
-    - `nonce`: nonce string, received within "WWW-Authenticate" header
-    - `realm`: realm string, received within "WWW-Authenticate" header
-    - `opaque`: opaque string, received within "WWW-Authenticate" header
-    - `algorithm`: type of hashing algorithm, used by the client
-    - `qop`: type of quality-of-protection, used by the client
-    - `cnonce`: client nonce, required if qop is "auth" or "auth-int"
-    - `nc`: client nonce count, required if qop is "auth" or "auth-int"
-    - `body`: body of the outgoing request (bytes), used if qop is "auth-int"
-    """
+    """Compile a digest authentication header string."""
 
     assert username
     assert password
@@ -91,9 +88,9 @@ def _make_digest_auth_header(username, password, method, uri, nonce,
             .format(username, auth_response, uri, nonce)
 
     # 'realm' and 'opaque' should be returned unchanged, even if empty
-    if realm != None:
+    if realm is not None:
         auth_header += ', realm="{0}"'.format(realm)
-    if opaque != None:
+    if opaque is not None:
         auth_header += ', opaque="{0}"'.format(opaque)
 
     if algorithm:
@@ -107,22 +104,21 @@ def _make_digest_auth_header(username, password, method, uri, nonce,
 
     return auth_header
 
+
 class HttpbinTestCase(unittest.TestCase):
-    """Httpbin tests"""
+    """responder-httpbin tests"""
 
     def setUp(self):
-        httpbin.app.debug = True
-        self.app = httpbin.app.test_client()
+        self.app = TestClient(
+            httpbin.api, base_url="http://localhost", follow_redirects=False
+        )
 
-    def test_index(self):   
+    def get_data(self, response):
+        return response.content
+
+    def test_index(self):
         response = self.app.get('/', headers={'User-Agent': 'test'})
         self.assertEqual(response.status_code, 200)
- 
-    def get_data(self, response):
-        if 'get_data' in dir(response):
-            return response.get_data()
-        else:
-            return response.data
 
     def test_response_headers_simple(self):
         supported_verbs = ['get', 'post']
@@ -130,8 +126,8 @@ class HttpbinTestCase(unittest.TestCase):
             method = getattr(self.app, verb)
             response = method('/response-headers?animal=dog')
             self.assertEqual(response.status_code, 200)
-            self.assertEqual(response.headers.get_all('animal'), ['dog'])
-            assert json.loads(response.data.decode('utf-8'))['animal'] == 'dog'
+            self.assertEqual(response.headers.get_list('animal', split_commas=True), ['dog'])
+            assert json.loads(response.content.decode('utf-8'))['animal'] == 'dog'
 
     def test_response_headers_multi(self):
         supported_verbs = ['get', 'post']
@@ -139,45 +135,46 @@ class HttpbinTestCase(unittest.TestCase):
             method = getattr(self.app, verb)
             response = method('/response-headers?animal=dog&animal=cat')
             self.assertEqual(response.status_code, 200)
-            self.assertEqual(response.headers.get_all('animal'), ['dog', 'cat'])
-            assert json.loads(response.data.decode('utf-8'))['animal'] == ['dog', 'cat']
+            self.assertEqual(response.headers.get_list('animal', split_commas=True), ['dog', 'cat'])
+            assert json.loads(response.content.decode('utf-8'))['animal'] == ['dog', 'cat']
 
     def test_get(self):
-        response = self.app.get('/get', headers={'User-Agent': 'test'})
+        response = self.app.get(
+            '/get', headers={'User-Agent': 'test', 'Content-Length': '0'}
+        )
         self.assertEqual(response.status_code, 200)
-        data = json.loads(response.data.decode('utf-8'))
+        data = json.loads(response.content.decode('utf-8'))
         self.assertEqual(data['args'], {})
         self.assertEqual(data['headers']['Host'], 'localhost')
         self.assertEqual(data['headers']['Content-Length'], '0')
         self.assertEqual(data['headers']['User-Agent'], 'test')
-        # self.assertEqual(data['origin'], None)
         self.assertEqual(data['url'], 'http://localhost/get')
-        self.assertTrue(response.data.endswith(b'\n'))
+        self.assertTrue(response.content.endswith(b'\n'))
 
     def test_anything(self):
         response = self.app.get('/anything')
         self.assertEqual(response.status_code, 200)
-        response = self.app.get('/anything/foo/bar')
+        response = self.app.get('/anything/foo/bar', headers={'Content-Length': '0'})
         self.assertEqual(response.status_code, 200)
-        data = json.loads(response.data.decode('utf-8'))
+        data = json.loads(response.content.decode('utf-8'))
         self.assertEqual(data['args'], {})
         self.assertEqual(data['headers']['Host'], 'localhost')
         self.assertEqual(data['headers']['Content-Length'], '0')
         self.assertEqual(data['url'], 'http://localhost/anything/foo/bar')
         self.assertEqual(data['method'], 'GET')
-        self.assertTrue(response.data.endswith(b'\n'))
+        self.assertTrue(response.content.endswith(b'\n'))
 
     def test_base64(self):
         greeting = u'Здравствуй, мир!'
         b64_encoded = _string_to_base64(greeting)
-        response = self.app.get(b'/base64/' + b64_encoded)
-        content = response.data.decode('utf-8')
+        response = self.app.get('/base64/' + b64_encoded.decode('utf-8'))
+        content = response.content.decode('utf-8')
         self.assertEqual(greeting, content)
 
     def test_post_binary(self):
         response = self.app.post('/post',
-                                 data=b'\x01\x02\x03\x81\x82\x83',
-                                 content_type='application/octet-stream')
+                                 content=b'\x01\x02\x03\x81\x82\x83',
+                                 headers={'Content-Type': 'application/octet-stream'})
         self.assertEqual(response.status_code, 200)
 
     def test_post_body_text(self):
@@ -188,44 +185,39 @@ class HttpbinTestCase(unittest.TestCase):
     def test_post_body_binary(self):
         response = self.app.post(
             '/post',
-            data={"file": b'\x01\x02\x03\x81\x82\x83'})
+            data={"file": '\x01\x02\x03\x81\x82\x83'})
         self.assertEqual(response.status_code, 200)
 
     def test_post_body_unicode(self):
-        response = self.app.post('/post', data=u'оживлённым'.encode('utf-8'))
-        self.assertEqual(json.loads(response.data.decode('utf-8'))['data'], u'оживлённым')
+        response = self.app.post('/post', content=u'оживлённым'.encode('utf-8'))
+        self.assertEqual(json.loads(response.content.decode('utf-8'))['data'], u'оживлённым')
 
     def test_post_file_with_missing_content_type_header(self):
-        # I built up the form data manually here because I couldn't find a way
-        # to convince the werkzeug test client to send files without the
-        # content-type of the file set.
+        # Build the multipart body manually so the file part carries no
+        # Content-Type header.
         data = '--bound\r\nContent-Disposition: form-data; name="media"; '
         data += 'filename="test.bin"\r\n\r\n\xa5\xc6\n--bound--\r\n'
         response = self.app.post(
             '/post',
-            content_type='multipart/form-data; boundary=bound',
-            data=data,
+            headers={'Content-Type': 'multipart/form-data; boundary=bound'},
+            content=data.encode('latin-1'),
         )
         self.assertEqual(response.status_code, 200)
 
     """
     This is currently a sort of negative-test.
-    We validate that when running Flask-only server that
-    Transfer-Encoding: chunked requests are unsupported and
-    we return 501 Not Implemented
+    We validate that Transfer-Encoding: chunked requests are unsupported and
+    we return 501 Not Implemented (httpbin's documented behavior).
     """
     def test_post_chunked(self):
         data = '{"animal":"dog"}'
         response = self.app.post(
             '/post',
-            content_type='application/json',
-            headers=[('Transfer-Encoding', 'chunked')],
-            data=data,
+            headers={'Content-Type': 'application/json',
+                     'Transfer-Encoding': 'chunked'},
+            content=data.encode('utf-8'),
         )
         self.assertEqual(response.status_code, 501)
-        #self.assertEqual(response.status_code, 200)
-        #self.assertEqual(json.loads(response.data.decode('utf-8'))['data'], '{"animal":"dog"}')
-        #self.assertEqual(json.loads(response.data.decode('utf-8'))['json'], {"animal": "dog"})
 
     def test_set_cors_headers_after_request(self):
         response = self.app.get('/get')
@@ -246,7 +238,7 @@ class HttpbinTestCase(unittest.TestCase):
         )
 
     def test_set_cors_headers_with_options_verb(self):
-        response = self.app.open('/get', method='OPTIONS')
+        response = self.app.request('OPTIONS', '/get')
         self.assertEqual(
             response.headers.get('Access-Control-Allow-Origin'), '*'
         )
@@ -260,12 +252,12 @@ class HttpbinTestCase(unittest.TestCase):
         self.assertEqual(
             response.headers.get('Access-Control-Max-Age'), '3600'
         )
-        # FIXME should we add any extra headers?
         self.assertNotIn(
             'Access-Control-Allow-Headers', response.headers
         )
+
     def test_set_cors_allow_headers(self):
-        response = self.app.open('/get', method='OPTIONS', headers={'Access-Control-Request-Headers': 'X-Test-Header'})
+        response = self.app.request('OPTIONS', '/get', headers={'Access-Control-Request-Headers': 'X-Test-Header'})
         self.assertEqual(
             response.headers.get('Access-Control-Allow-Headers'), 'X-Test-Header'
         )
@@ -279,8 +271,8 @@ class HttpbinTestCase(unittest.TestCase):
         }
         response = self.app.get('/headers', headers=headers)
         self.assertEqual(response.status_code, 200)
-        self.assertTrue({'Accept', 'Host', 'User-Agent'}.issubset(set(response.json['headers'].keys())))
-        self.assertNotIn('Via', response.json)
+        self.assertTrue({'Accept', 'Host', 'User-Agent'}.issubset(set(response.json()['headers'].keys())))
+        self.assertNotIn('Via', response.json()['headers'])
 
     def test_headers_show_env(self):
         headers = {
@@ -291,13 +283,13 @@ class HttpbinTestCase(unittest.TestCase):
         }
         response = self.app.get('/headers?show_env=true', headers=headers)
         self.assertEqual(response.status_code, 200)
-        self.assertTrue({'Accept', 'Host', 'User-Agent', 'Via'}.issubset(set(response.json['headers'].keys())))
+        self.assertTrue({'Accept', 'Host', 'User-Agent', 'Via'}.issubset(set(response.json()['headers'].keys())))
 
     def test_user_agent(self):
         response = self.app.get(
             '/user-agent', headers={'User-Agent': 'test'}
         )
-        self.assertIn('test', response.data.decode('utf-8'))
+        self.assertIn('test', response.content.decode('utf-8'))
         self.assertEqual(response.status_code, 200)
 
     def test_gzip(self):
@@ -315,20 +307,20 @@ class HttpbinTestCase(unittest.TestCase):
             headers={'Authorization': 'Bearer ' + token}
         )
         self.assertEqual(response.status_code, 200)
-        assert json.loads(response.data.decode('utf-8'))['token'] == token
+        assert json.loads(response.content.decode('utf-8'))['token'] == token
 
     def test_bearer_auth_with_wrong_authorization_type(self):
         """Sending an non-Bearer Authorization header to /bearer should return a 401"""
         auth_headers = (
             ('Authorization', 'Basic 1234abcd'),
             ('Authorization', ''),
-            ('',  '')
+            ('',  ''),
         )
         for header in auth_headers:
-            response = self.app.get(
-                '/bearer',
-                headers={header[0]: header[1]}
-            )
+            if not header[0]:
+                response = self.app.get('/bearer')
+            else:
+                response = self.app.get('/bearer', headers={header[0]: header[1]})
             self.assertEqual(response.status_code, 401)
 
     def test_bearer_auth_with_missing_token(self):
@@ -343,11 +335,6 @@ class HttpbinTestCase(unittest.TestCase):
         auth_header = 'Digest username="user",realm="wrong",nonce="wrong",uri="/digest-auth/user/passwd/MD5",response="wrong",opaque="wrong"'
         response = self.app.get(
             '/digest-auth/auth/user/passwd/MD5',
-            environ_base={
-                # httpbin's digest auth implementation uses the remote addr to
-                # build the nonce
-                'REMOTE_ADDR': '127.0.0.1',
-            },
             headers={
                 'Authorization': auth_header,
             }
@@ -362,7 +349,7 @@ class HttpbinTestCase(unittest.TestCase):
         for qop in None, 'auth', 'auth-int',:
             for algorithm in None, 'MD5', 'SHA-256', 'SHA-512':
                 for body in None, b'', b'request payload':
-                    for stale_after in (None, 1, 4) if algorithm else (None,) :
+                    for stale_after in (None, 1, 4) if algorithm else (None,):
                         self._test_digest_auth(username, password, qop, algorithm, body, stale_after)
 
     def test_digest_auth_with_wrong_authorization_type(self):
@@ -370,13 +357,13 @@ class HttpbinTestCase(unittest.TestCase):
         auth_headers = (
             ('Authorization', 'Basic 1234abcd'),
             ('Authorization', ''),
-            ('',  '')
+            ('',  ''),
         )
         for header in auth_headers:
-            response = self.app.get(
-                '/digest-auth/auth/myname/mysecret',
-                headers={header[0]: header[1]}
-            )
+            if not header[0]:
+                response = self.app.get('/digest-auth/auth/myname/mysecret')
+            else:
+                response = self.app.get('/digest-auth/auth/myname/mysecret', headers={header[0]: header[1]})
             self.assertEqual(response.status_code, 401)
 
     def _test_digest_auth(self, username, password, qop, algorithm=None, body=None, stale_after=None):
@@ -389,20 +376,14 @@ class HttpbinTestCase(unittest.TestCase):
         authorized_response, nonce = self._test_digest_response_for_auth_request(header, username, password, qop, uri, body)
         self.assertEqual(authorized_response.status_code, 200)
 
-        if None == stale_after :
+        if None == stale_after:
             return
 
-        # test stale after scenerio
+        # test stale after scenario
         self._digest_auth_stale_after_check(header, username, password, uri, body, qop, stale_after)
 
     def _test_digest_auth_first_challenge(self, uri):
-        unauthorized_response = self.app.get(
-            uri,
-            environ_base={
-                # digest auth uses the remote addr to build the nonce
-                'REMOTE_ADDR': '127.0.0.1',
-            }
-        )
+        unauthorized_response = self.app.get(uri)
         # make sure it returns a 401
         self.assertEqual(unauthorized_response.status_code, 401)
         return unauthorized_response
@@ -417,10 +398,10 @@ class HttpbinTestCase(unittest.TestCase):
 
     def _digest_auth_stale_after_check(self, header, username, password, uri, body, qop, stale_after):
         for nc in range(2, stale_after + 1):
-            authorized_response, nonce = self._test_digest_response_for_auth_request(header, username, password, qop, uri, \
+            authorized_response, nonce = self._test_digest_response_for_auth_request(header, username, password, qop, uri,
                                                                               body, nc)
             self.assertEqual(authorized_response.status_code, 200)
-        stale_response, nonce = self._test_digest_response_for_auth_request(header, username, password, qop, uri, \
+        stale_response, nonce = self._test_digest_response_for_auth_request(header, username, password, qop, uri,
                                                                      body, stale_after + 1)
         self.assertEqual(stale_response.status_code, 401)
         header = stale_response.headers.get('WWW-Authenticate')
@@ -435,7 +416,7 @@ class HttpbinTestCase(unittest.TestCase):
         nonce = nonce or d['nonce']
         realm = d['realm']
         opaque = d['opaque']
-        if qop :
+        if qop:
             self.assertIn(qop, [x.strip() for x in d['qop'].split(',')], 'Challenge should contains expected qop')
         algorithm = d['algorithm']
 
@@ -445,17 +426,13 @@ class HttpbinTestCase(unittest.TestCase):
             username, password, 'GET', uri, nonce, realm, opaque, algorithm, qop, cnonce, nc, body)
 
         # make second request
-        return self.app.get(
+        return self.app.request(
+            'GET',
             uri,
-            environ_base={
-                # httpbin's digest auth implementation uses the remote addr to
-                # build the nonce
-                'REMOTE_ADDR': '127.0.0.1',
-            },
             headers={
                 'Authorization': auth_header,
             },
-            data=body
+            content=body
         ), nonce
 
     def test_digest_auth_wrong_pass(self):
@@ -478,7 +455,7 @@ class HttpbinTestCase(unittest.TestCase):
         header = wrong_pass_response.headers.get('WWW-Authenticate')
         self.assertNotIn('stale=TRUE', header)
 
-        reused_nonce_response, nonce =  self._test_digest_response_for_auth_request(header, username, password, qop, uri, \
+        reused_nonce_response, nonce = self._test_digest_response_for_auth_request(header, username, password, qop, uri,
                                                                               body, nonce=nonce)
         self.assertEqual(reused_nonce_response.status_code, 401)
         header = reused_nonce_response.headers.get('WWW-Authenticate')
@@ -486,7 +463,7 @@ class HttpbinTestCase(unittest.TestCase):
 
     def test_drip(self):
         response = self.app.get('/drip?numbytes=400&duration=2&delay=1')
-        self.assertEqual(response.content_length, 400)
+        self.assertEqual(int(response.headers.get('Content-Length')), 400)
         self.assertEqual(len(self.get_data(response)), 400)
         self.assertEqual(response.status_code, 200)
 
@@ -498,7 +475,7 @@ class HttpbinTestCase(unittest.TestCase):
 
     def test_drip_with_custom_code(self):
         response = self.app.get('/drip?numbytes=400&duration=2&code=500')
-        self.assertEqual(response.content_length, 400)
+        self.assertEqual(int(response.headers.get('Content-Length')), 400)
         self.assertEqual(len(self.get_data(response)), 400)
         self.assertEqual(response.status_code, 500)
 
@@ -509,17 +486,10 @@ class HttpbinTestCase(unittest.TestCase):
 
     def test_bytes_with_seed(self):
         response = self.app.get('/bytes/10?seed=0')
-        # The RNG changed in python3, so even though we are
-        # setting the seed, we can't expect the value to be the
-        # same across both interpreters.
-        if six.PY3:
-            self.assertEqual(
-                response.data, b'\xc5\xd7\x14\x84\xf8\xcf\x9b\xf4\xb7o'
-            )
-        else:
-            self.assertEqual(
-                response.data, b'\xd8\xc2kB\x82g\xc8Mz\x95'
-            )
+        # The RNG (Mersenne Twister) is stable across CPython 3.x.
+        self.assertEqual(
+            response.content, b'\xc5\xd7\x14\x84\xf8\xcf\x9b\xf4\xb7o'
+        )
 
     def test_stream_bytes(self):
         response = self.app.get('/stream-bytes/1024')
@@ -528,25 +498,17 @@ class HttpbinTestCase(unittest.TestCase):
 
     def test_stream_bytes_with_seed(self):
         response = self.app.get('/stream-bytes/10?seed=0')
-        # The RNG changed in python3, so even though we are
-        # setting the seed, we can't expect the value to be the
-        # same across both interpreters.
-        if six.PY3:
-            self.assertEqual(
-                response.data, b'\xc5\xd7\x14\x84\xf8\xcf\x9b\xf4\xb7o'
-            )
-        else:
-            self.assertEqual(
-                response.data, b'\xd8\xc2kB\x82g\xc8Mz\x95'
-            )
+        self.assertEqual(
+            response.content, b'\xc5\xd7\x14\x84\xf8\xcf\x9b\xf4\xb7o'
+        )
 
     def test_delete_endpoint_returns_body(self):
-        response = self.app.delete(
+        response = self.app.request(
+            'DELETE',
             '/delete',
             data={'name': 'kevin'},
-            content_type='application/x-www-form-urlencoded'
         )
-        form_data = json.loads(response.data.decode('utf-8'))['form']
+        form_data = json.loads(response.content.decode('utf-8'))['form']
         self.assertEqual(form_data, {'name': 'kevin'})
 
     def test_methods__to_status_endpoint(self):
@@ -560,28 +522,28 @@ class HttpbinTestCase(unittest.TestCase):
             'TRACE',
         ]
         for m in methods:
-            response = self.app.open(path='/status/418', method=m)
+            response = self.app.request(m, '/status/418')
             self.assertEqual(response.status_code, 418)
 
     def test_status_endpoint_invalid_code(self):
-        response = self.app.get(path='/status/4!9')
+        response = self.app.get('/status/4!9')
         self.assertEqual(response.status_code, 400)
 
     def test_status_endpoint_invalid_codes(self):
-        response = self.app.get(path='/status/200,402,foo')
+        response = self.app.get('/status/200,402,foo')
         self.assertEqual(response.status_code, 400)
 
     def test_xml_endpoint(self):
-        response = self.app.get(path='/xml')
+        response = self.app.get('/xml')
         self.assertEqual(
             response.headers.get('Content-Type'), 'application/xml'
         )
 
     def test_x_forwarded_proto(self):
-        response = self.app.get(path='/get', headers={
-            'X-Forwarded-Proto':'https'
+        response = self.app.get('/get', headers={
+            'X-Forwarded-Proto': 'https'
         })
-        assert json.loads(response.data.decode('utf-8'))['url'].startswith('https://')
+        assert json.loads(response.content.decode('utf-8'))['url'].startswith('https://')
 
     def test_redirect_n_higher_than_1(self):
         response = self.app.get('/redirect/5')
@@ -591,8 +553,8 @@ class HttpbinTestCase(unittest.TestCase):
 
     def test_redirect_to_post(self):
         response = self.app.post('/redirect-to?url=/post&status_code=307',
-                                 data=b'\x01\x02\x03\x81\x82\x83',
-                                 content_type='application/octet-stream')
+                                 content=b'\x01\x02\x03\x81\x82\x83',
+                                 headers={'Content-Type': 'application/octet-stream'})
         self.assertEqual(response.status_code, 307)
         self.assertEqual(
             response.headers.get('Location'), '/post'
@@ -653,7 +615,7 @@ class HttpbinTestCase(unittest.TestCase):
     def test_request_range_with_parameters(self):
         response = self.app.get(
             '/range/100?duration=1.5&chunk_size=5',
-            headers={ 'Range': 'bytes=10-24' }
+            headers={'Range': 'bytes=10-24'}
         )
 
         self.assertEqual(response.status_code, 206)
@@ -666,7 +628,7 @@ class HttpbinTestCase(unittest.TestCase):
     def test_request_range_first_15_bytes(self):
         response = self.app.get(
             '/range/1000',
-            headers={ 'Range': 'bytes=0-15' }
+            headers={'Range': 'bytes=0-15'}
         )
 
         self.assertEqual(response.status_code, 206)
@@ -677,7 +639,7 @@ class HttpbinTestCase(unittest.TestCase):
     def test_request_range_open_ended_last_6_bytes(self):
         response = self.app.get(
             '/range/26',
-            headers={ 'Range': 'bytes=20-' }
+            headers={'Range': 'bytes=20-'}
         )
 
         self.assertEqual(response.status_code, 206)
@@ -689,7 +651,7 @@ class HttpbinTestCase(unittest.TestCase):
     def test_request_range_suffix(self):
         response = self.app.get(
             '/range/26',
-            headers={ 'Range': 'bytes=-5' }
+            headers={'Range': 'bytes=-5'}
         )
 
         self.assertEqual(response.status_code, 206)
@@ -701,8 +663,7 @@ class HttpbinTestCase(unittest.TestCase):
     def test_request_out_of_bounds(self):
         response = self.app.get(
             '/range/26',
-            headers={ 'Range': 'bytes=10-5',
-            }
+            headers={'Range': 'bytes=10-5'}
         )
 
         self.assertEqual(response.status_code, 416)
@@ -713,22 +674,20 @@ class HttpbinTestCase(unittest.TestCase):
 
         response = self.app.get(
             '/range/26',
-            headers={ 'Range': 'bytes=32-40',
-            }
+            headers={'Range': 'bytes=32-40'}
         )
-
         self.assertEqual(response.status_code, 416)
+
         response = self.app.get(
             '/range/26',
-            headers={ 'Range': 'bytes=0-40',
-            }
+            headers={'Range': 'bytes=0-40'}
         )
         self.assertEqual(response.status_code, 416)
 
     def test_etag_if_none_match_matches(self):
         response = self.app.get(
             '/etag/abc',
-            headers={ 'If-None-Match': 'abc' }
+            headers={'If-None-Match': 'abc'}
         )
         self.assertEqual(response.status_code, 304)
         self.assertEqual(response.headers.get('ETag'), 'abc')
@@ -736,7 +695,7 @@ class HttpbinTestCase(unittest.TestCase):
     def test_etag_if_none_match_matches_list(self):
         response = self.app.get(
             '/etag/abc',
-            headers={ 'If-None-Match': '"123", "abc"' }
+            headers={'If-None-Match': '"123", "abc"'}
         )
         self.assertEqual(response.status_code, 304)
         self.assertEqual(response.headers.get('ETag'), 'abc')
@@ -744,7 +703,7 @@ class HttpbinTestCase(unittest.TestCase):
     def test_etag_if_none_match_matches_star(self):
         response = self.app.get(
             '/etag/abc',
-            headers={ 'If-None-Match': '*' }
+            headers={'If-None-Match': '*'}
         )
         self.assertEqual(response.status_code, 304)
         self.assertEqual(response.headers.get('ETag'), 'abc')
@@ -752,7 +711,7 @@ class HttpbinTestCase(unittest.TestCase):
     def test_etag_if_none_match_w_prefix(self):
         response = self.app.get(
             '/etag/c3piozzzz',
-            headers={ 'If-None-Match': 'W/"xyzzy", W/"r2d2xxxx", W/"c3piozzzz"' }
+            headers={'If-None-Match': 'W/"xyzzy", W/"r2d2xxxx", W/"c3piozzzz"'}
         )
         self.assertEqual(response.status_code, 304)
         self.assertEqual(response.headers.get('ETag'), 'c3piozzzz')
@@ -760,7 +719,7 @@ class HttpbinTestCase(unittest.TestCase):
     def test_etag_if_none_match_has_no_match(self):
         response = self.app.get(
             '/etag/abc',
-            headers={ 'If-None-Match': '123' }
+            headers={'If-None-Match': '123'}
         )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.headers.get('ETag'), 'abc')
@@ -768,7 +727,7 @@ class HttpbinTestCase(unittest.TestCase):
     def test_etag_if_match_matches(self):
         response = self.app.get(
             '/etag/abc',
-            headers={ 'If-Match': 'abc' }
+            headers={'If-Match': 'abc'}
         )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.headers.get('ETag'), 'abc')
@@ -776,7 +735,7 @@ class HttpbinTestCase(unittest.TestCase):
     def test_etag_if_match_matches_list(self):
         response = self.app.get(
             '/etag/abc',
-            headers={ 'If-Match': '"123", "abc"' }
+            headers={'If-Match': '"123", "abc"'}
         )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.headers.get('ETag'), 'abc')
@@ -784,7 +743,7 @@ class HttpbinTestCase(unittest.TestCase):
     def test_etag_if_match_matches_star(self):
         response = self.app.get(
             '/etag/abc',
-            headers={ 'If-Match': '*' }
+            headers={'If-Match': '*'}
         )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.headers.get('ETag'), 'abc')
@@ -792,7 +751,7 @@ class HttpbinTestCase(unittest.TestCase):
     def test_etag_if_match_has_no_match(self):
         response = self.app.get(
             '/etag/abc',
-            headers={ 'If-Match': '123' }
+            headers={'If-Match': '123'}
         )
         self.assertEqual(response.status_code, 412)
         self.assertNotIn('ETag', response.headers)
@@ -804,13 +763,67 @@ class HttpbinTestCase(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.headers.get('ETag'), 'abc')
 
+    # --- responder-port parity regression tests --------------------------------
+    # These guard fidelity gaps found while porting Flask httpbin to responder.
+
+    def test_multipart_repeated_fields_and_files_become_lists(self):
+        response = self.app.post(
+            '/post',
+            files=[
+                ('f', (None, 'v1')),
+                ('f', (None, 'v2')),
+                ('g', ('a.txt', b'A', 'text/plain')),
+                ('g', ('b.txt', b'B', 'text/plain')),
+            ],
+        )
+        data = json.loads(response.content.decode('utf-8'))
+        self.assertEqual(data['form']['f'], ['v1', 'v2'])
+        self.assertEqual(data['files']['g'], ['A', 'B'])
+
+    def test_blank_query_param_is_kept(self):
+        response = self.app.get('/get?foo=&bar=baz')
+        data = json.loads(response.content.decode('utf-8'))
+        self.assertEqual(data['args']['foo'], '')
+        self.assertEqual(data['args']['bar'], 'baz')
+
+    def test_duplicate_request_headers_are_combined(self):
+        response = self.app.get('/headers', headers=[('X-Foo', 'a'), ('X-Foo', 'b')])
+        self.assertEqual(response.json()['headers']['X-Foo'], 'a, b')
+
+    def test_malformed_digest_header_returns_401_not_500(self):
+        response = self.app.get(
+            '/digest-auth/auth/user/passwd',
+            headers={'Authorization': 'Digest username="user", nonce="abc", qop=auth'},
+        )
+        self.assertEqual(response.status_code, 401)
+        self.assertIn('Digest', response.headers.get('WWW-Authenticate'))
+
+    def test_cookies_are_plain(self):
+        response = self.app.get('/cookies/set/foo/bar')
+        set_cookie = response.headers.get('Set-Cookie', '')
+        self.assertNotIn('HttpOnly', set_cookie)
+        self.assertNotIn('SameSite', set_cookie)
+
+    def test_options_undefined_path_returns_404(self):
+        response = self.app.request('OPTIONS', '/this-route-does-not-exist')
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.headers.get('Access-Control-Allow-Origin'), '*')
+
+    def test_status_non_mapped_code_has_html_content_type(self):
+        response = self.app.get('/status/500')
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(
+            response.headers.get('Content-Type'), 'text/html; charset=utf-8'
+        )
+
     def test_parse_multi_value_header(self):
-        self.assertEqual(parse_multi_value_header('xyzzy'), [ "xyzzy" ])
-        self.assertEqual(parse_multi_value_header('"xyzzy"'), [ "xyzzy" ])
-        self.assertEqual(parse_multi_value_header('W/"xyzzy"'), [ "xyzzy" ])
-        self.assertEqual(parse_multi_value_header('"xyzzy", "r2d2xxxx", "c3piozzzz"'), [ "xyzzy", "r2d2xxxx", "c3piozzzz" ])
-        self.assertEqual(parse_multi_value_header('W/"xyzzy", W/"r2d2xxxx", W/"c3piozzzz"'), [ "xyzzy", "r2d2xxxx", "c3piozzzz" ])
-        self.assertEqual(parse_multi_value_header('*'), [ "*" ])
+        self.assertEqual(parse_multi_value_header('xyzzy'), ["xyzzy"])
+        self.assertEqual(parse_multi_value_header('"xyzzy"'), ["xyzzy"])
+        self.assertEqual(parse_multi_value_header('W/"xyzzy"'), ["xyzzy"])
+        self.assertEqual(parse_multi_value_header('"xyzzy", "r2d2xxxx", "c3piozzzz"'), ["xyzzy", "r2d2xxxx", "c3piozzzz"])
+        self.assertEqual(parse_multi_value_header('W/"xyzzy", W/"r2d2xxxx", W/"c3piozzzz"'), ["xyzzy", "r2d2xxxx", "c3piozzzz"])
+        self.assertEqual(parse_multi_value_header('*'), ["*"])
+
 
 if __name__ == '__main__':
     unittest.main()

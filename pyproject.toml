@@ -1,0 +1,55 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "responder-httpbin"
+dynamic = ["version"]
+description = "HTTP Request & Response Service, powered by the responder web framework."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Kenneth Reitz", email = "me@kennethreitz.org" }]
+keywords = ["http", "rest", "api", "testing", "integration", "responder", "asgi"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Natural Language :: English",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+dependencies = [
+    "responder>=5.0.0",
+    "brotli",
+    "granian>=2.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/kennethreitz/responder-httpbin"
+Repository = "https://github.com/kennethreitz/responder-httpbin"
+Framework = "https://responder.kennethreitz.org/"
+
+[dependency-groups]
+dev = ["pytest>=7"]
+
+[tool.hatch.version]
+path = "httpbin/VERSION"
+pattern = "(?P<version>.+)"
+
+[tool.hatch.build.targets.wheel]
+packages = ["httpbin"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/httpbin",
+    "/test_httpbin.py",
+    "/README.md",
+    "/LICENSE",
+    "/AUTHORS",
+]

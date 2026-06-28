@@ -4,57 +4,53 @@
 httpbin.core
 ~~~~~~~~~~~~
 
-This module provides the core HttpBin experience.
+The core responder-httpbin experience: a faithful port of httpbin's endpoints
+to the `responder <https://responder.kennethreitz.org/>`_ ASGI web framework.
+
+This is a dogfooding fork — not httpbin.org — that exercises responder end to
+end: native OpenAPI/Swagger, ASGI middleware, async streaming, templates,
+typed path params, and the built-in httpx test client.
 """
 
+import asyncio
 import base64
 import json
 import os
 import random
+import re
 import time
 import uuid
-import argparse
+from urllib.parse import urlencode
 
-from flask import (
-    Flask,
-    Response,
-    request,
-    render_template,
-    redirect,
-    jsonify as flask_jsonify,
-    make_response,
-    url_for,
-    abort,
-)
-from six.moves import range as xrange
-from werkzeug.datastructures import WWWAuthenticate, MultiDict
-from werkzeug.http import http_date
-from werkzeug.wrappers import BaseResponse
-from werkzeug.http import parse_authorization_header
-from flasgger import Swagger, NO_SANITIZER
+import responder
+from starlette.datastructures import MutableHeaders
 
 from . import filters
 from .helpers import (
-    get_headers,
-    status_code,
-    get_dict,
-    get_request_range,
+    ANGRY_ASCII,
+    ROBOT_TXT,
     check_basic_auth,
     check_digest_auth,
-    secure_cookie,
-    H,
-    ROBOT_TXT,
-    ANGRY_ASCII,
-    parse_multi_value_header,
+    digest_challenge_header,
+    get_dict,
+    get_headers,
+    get_request_range,
+    get_url,
+    http_date,
     next_stale_after_value,
-    digest_challenge_response,
+    parse_authorization_header,
+    parse_multi_value_header,
+    query_has,
+    query_multi,
+    query_pairs,
+    secure_cookie,
+    set_status,
 )
 from .utils import weighted_choice
-from .structures import CaseInsensitiveDict
 
-with open(
-    os.path.join(os.path.realpath(os.path.dirname(__file__)), "VERSION")
-) as version_file:
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+with open(os.path.join(HERE, "VERSION")) as version_file:
     version = version_file.read().strip()
 
 ENV_COOKIES = (
@@ -68,168 +64,187 @@ ENV_COOKIES = (
     "__utmb",
 )
 
+TRACKING_ENABLED = "HTTPBIN_TRACKING" in os.environ
 
-def jsonify(*args, **kwargs):
-    response = flask_jsonify(*args, **kwargs)
-    if not response.data.endswith(b"\n"):
-        response.data += b"\n"
-    return response
+# ---
+# App
+# ---
+
+api = responder.API(
+    title="responder-httpbin",
+    version=version,
+    description=(
+        "A simple HTTP Request &amp; Response Service — the httpbin API, "
+        "running on the <a href='https://responder.kennethreitz.org/'>responder</a> "
+        "web framework. A dogfooding fork; <b>not</b> httpbin.org."
+    ),
+    openapi="3.0.2",
+    docs_route="/",
+    openapi_route="/schema.yml",
+    templates_dir=os.path.join(HERE, "templates"),
+    static_dir=os.path.join(HERE, "static"),
+    static_route="/static",
+    auto_escape=False,
+    gzip=False,  # /gzip /deflate /brotli encode explicitly; keep exact Content-Length
+    secret_key=os.environ.get("SECRET_KEY", "responder-httpbin-not-secret"),
+)
 
 
-# Prevent WSGI from correcting the casing of the Location header
-BaseResponse.autocorrect_location_header = False
+# ----------
+# Middleware
+# ----------
 
-# Find the correct template folder when running from a different location
-tmpl_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates")
 
-app = Flask(__name__, template_folder=tmpl_dir)
-app.debug = bool(os.environ.get("DEBUG"))
-app.config["JSONIFY_PRETTYPRINT_REGULAR"] = True
+class HttpbinMiddleware:
+    """A single ASGI middleware covering httpbin's cross-cutting behavior.
 
-app.add_template_global("HTTPBIN_TRACKING" in os.environ, name="tracking_enabled")
+    Replaces Flask's ``before_request``/``after_request`` hooks:
 
-app.config["SWAGGER"] = {"title": "httpbin.org", "uiversion": 3}
+    * ``Transfer-Encoding: chunked`` → ``501`` (httpbin rejects chunked bodies).
+    * every response (including responder's automatic-``OPTIONS`` preflight) gets
+      httpbin's permissive CORS headers — ``Access-Control-Allow-Origin`` echoes
+      the Origin (defaulting to ``*``) and ``Access-Control-Allow-Credentials:
+      true`` — emitted even when no Origin header is present, which Starlette's
+      native CORS middleware will not do. ``OPTIONS`` additionally gets the
+      preflight method/age/header fields.
 
-template = {
-    "swagger": "2.0",
-    "info": {
-        "title": "httpbin.org",
-        "description": (
-            "A simple HTTP Request & Response Service."
-            "<br/> <br/> <b>Run locally: </b> <code>$ docker run -p 80:80 kennethreitz/httpbin</code>"
-        ),
-        "contact": {
-            "responsibleOrganization": "Kenneth Reitz",
-            "responsibleDeveloper": "Kenneth Reitz",
-            "email": "me@kennethreitz.org",
-            "url": "https://kennethreitz.org",
-        },
-        # "termsOfService": "http://me.com/terms",
-        "version": version,
-    },
-    "host": "httpbin.org",  # overrides localhost:5000
-    "basePath": "/",  # base bash for blueprint registration
-    "schemes": ["https"],
-    "protocol": "https",
-    "tags": [
-        {
-            "name": "HTTP Methods",
-            "description": "Testing different HTTP verbs",
-            # 'externalDocs': {'description': 'Learn more', 'url': 'https://www.w3.org/Protocols/rfc2616/rfc2616-sec9.html'}
-        },
-        {"name": "Auth", "description": "Auth methods"},
-        {
-            "name": "Status codes",
-            "description": "Generates responses with given status code",
-        },
-        {"name": "Request inspection", "description": "Inspect the request data"},
-        {
-            "name": "Response inspection",
-            "description": "Inspect the response data like caching and headers",
-        },
-        {
-            "name": "Response formats",
-            "description": "Returns responses in different data formats",
-        },
-        {"name": "Dynamic data", "description": "Generates random and dynamic data"},
-        {"name": "Cookies", "description": "Creates, reads and deletes Cookies"},
-        {"name": "Images", "description": "Returns different image formats"},
-        {"name": "Redirects", "description": "Returns different redirect responses"},
-        {
-            "name": "Anything",
-            "description": "Returns anything that is passed to request",
-        },
-    ],
-}
+    Because OPTIONS is routed (not short-circuited), undefined paths still 404
+    and method-restricted routes never run a handler for a preflight.
+    """
 
-swagger_config = {
-    "headers": [],
-    "specs": [
-        {
-            "endpoint": "spec",
-            "route": "/spec.json",
-            "rule_filter": lambda rule: True,  # all in
-            "model_filter": lambda tag: True,  # all in
+    cors_methods = "GET, POST, PUT, DELETE, PATCH, OPTIONS"
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        req_headers = {
+            key.decode("latin-1").lower(): value.decode("latin-1")
+            for key, value in scope.get("headers", [])
         }
-    ],
-    "static_url_path": "/flasgger_static",
-    # "static_folder": "static",  # must be set by user
-    "swagger_ui": True,
-    "specs_route": "/",
-}
+        method = scope["method"]
+        origin = req_headers.get("origin", "*")
 
-swagger = Swagger(app, sanitizer=NO_SANITIZER, template=template, config=swagger_config)
+        if req_headers.get("transfer-encoding", "").lower() == "chunked":
+            body = b"Chunked requests are not supported."
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 501,
+                    "headers": [
+                        (b"content-type", b"text/html; charset=utf-8"),
+                        (b"content-length", str(len(body)).encode("latin-1")),
+                        (b"access-control-allow-origin", origin.encode("latin-1")),
+                        (b"access-control-allow-credentials", b"true"),
+                    ],
+                }
+            )
+            await send({"type": "http.response.body", "body": body})
+            return
 
-# Set up Bugsnag exception tracking, if desired. To use Bugsnag, install the
-# Bugsnag Python client with the command "pip install bugsnag", and set the
-# environment variable BUGSNAG_API_KEY. You can also optionally set
-# BUGSNAG_RELEASE_STAGE.
-if os.environ.get("BUGSNAG_API_KEY") is not None:
-    try:
-        import bugsnag
-        import bugsnag.flask
+        async def send_with_cors(message):
+            if message["type"] == "http.response.start":
+                mutable = MutableHeaders(scope=message)
+                mutable["Access-Control-Allow-Origin"] = origin
+                mutable["Access-Control-Allow-Credentials"] = "true"
+                # OPTIONS is routed normally (responder's automatic-OPTIONS gives
+                # 200 for defined routes, 404 otherwise); we layer on the
+                # preflight headers here so undefined paths still 404.
+                if method == "OPTIONS":
+                    mutable["Access-Control-Allow-Methods"] = self.cors_methods
+                    mutable["Access-Control-Max-Age"] = "3600"
+                    requested = req_headers.get("access-control-request-headers")
+                    if requested is not None:
+                        mutable["Access-Control-Allow-Headers"] = requested
+            await send(message)
 
-        release_stage = os.environ.get("BUGSNAG_RELEASE_STAGE") or "production"
-        bugsnag.configure(
-            api_key=os.environ.get("BUGSNAG_API_KEY"),
-            project_root=os.path.dirname(os.path.abspath(__file__)),
-            use_ssl=True,
-            release_stage=release_stage,
-            ignore_classes=["werkzeug.exceptions.NotFound"],
-        )
-        bugsnag.flask.handle_exceptions(app)
-    except:
-        app.logger.warning("Unable to initialize Bugsnag exception handling.")
-
-# -----------
-# Middlewares
-# -----------
-"""
-https://github.com/kennethreitz/httpbin/issues/340
-Adds a middleware to provide chunked request encoding support running under
-gunicorn only.
-Werkzeug required environ 'wsgi.input_terminated' to be set otherwise it
-empties the input request stream.
-- gunicorn seems to support input_terminated but does not add the environ,
-  so we add it here.
-- flask will hang and does not seem to properly terminate the request, so
-  we explicitly deny chunked requests.
-"""
+        await self.app(scope, receive, send_with_cors)
 
 
-@app.before_request
-def before_request():
-    if request.environ.get("HTTP_TRANSFER_ENCODING", "").lower() == "chunked":
-        server = request.environ.get("SERVER_SOFTWARE", "")
-        if server.lower().startswith("gunicorn/"):
-            if "wsgi.input_terminated" in request.environ:
-                app.logger.debug(
-                    "environ wsgi.input_terminated already set, keeping: %s"
-                    % request.environ["wsgi.input_terminated"]
-                )
-            else:
-                request.environ["wsgi.input_terminated"] = 1
-        else:
-            abort(501, "Chunked requests are not supported for server %s" % server)
+api.add_middleware(HttpbinMiddleware)
 
 
-@app.after_request
-def set_cors_headers(response):
-    response.headers["Access-Control-Allow-Origin"] = request.headers.get("Origin", "*")
-    response.headers["Access-Control-Allow-Credentials"] = "true"
+# -------
+# Helpers
+# -------
 
-    if request.method == "OPTIONS":
-        # Both of these headers are only used for the "preflight request"
-        # http://www.w3.org/TR/cors/#access-control-allow-methods-response-header
-        response.headers[
-            "Access-Control-Allow-Methods"
-        ] = "GET, POST, PUT, DELETE, PATCH, OPTIONS"
-        response.headers["Access-Control-Max-Age"] = "3600"  # 1 hour cache
-        if request.headers.get("Access-Control-Request-Headers") is not None:
-            response.headers["Access-Control-Allow-Headers"] = request.headers[
-                "Access-Control-Request-Headers"
-            ]
-    return response
+_ROUTE_PATTERNS = {}
+
+
+def route(pattern, methods=None, name=None, extra_patterns=()):
+    """Register a responder route and remember its pattern for ``url_for``."""
+
+    def decorator(handler):
+        endpoint = name or handler.__name__
+        _ROUTE_PATTERNS.setdefault(endpoint, pattern)
+        api.add_route(pattern, handler, methods=methods)
+        for extra in extra_patterns:
+            api.add_route(extra, handler, methods=methods)
+        return handler
+
+    return decorator
+
+
+def url_for(endpoint, **values):
+    """Flask-style ``url_for``: fill path params, append the rest as a query string."""
+    pattern = _ROUTE_PATTERNS.get(endpoint)
+    if pattern is None:
+        return "#"
+
+    values = dict(values)
+
+    def replace(match):
+        key = match.group(1).split(":")[0]
+        if key in values:
+            return str(values.pop(key))
+        return match.group(0)
+
+    path = re.sub(r"\{([^}]+)\}", replace, pattern)
+    if values:
+        path += "?" + urlencode(values)
+    return path
+
+
+def host_url(req):
+    """Scheme + host for building absolute URLs to our own endpoints."""
+    return "{0}://{1}".format(req.url.scheme, req.headers.get("host", ""))
+
+
+# Flask's jsonify (with JSONIFY_PRETTYPRINT_REGULAR) used these separators:
+# indent=2 with a trailing space after each structural comma.
+JSON_SEPARATORS = (", ", ": ")
+
+
+def dumps(data):
+    """JSON, formatted byte-for-byte like the original Flask httpbin output."""
+    return json.dumps(data, indent=2, sort_keys=True, separators=JSON_SEPARATORS) + "\n"
+
+
+def jsonify(resp, *args, **kwargs):
+    """Pretty-printed JSON body with a trailing newline (matches httpbin)."""
+    if kwargs:
+        data = kwargs
+    elif len(args) == 1:
+        data = args[0]
+    else:
+        data = list(args)
+    resp.content = dumps(data).encode("utf-8")
+    resp.mimetype = "application/json"
+    return resp
+
+
+def resource(filename):
+    path = os.path.join(HERE, "templates", filename)
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def text_resource(filename):
+    return resource(filename).decode("utf-8")
 
 
 # ------
@@ -237,167 +252,85 @@ def set_cors_headers(response):
 # ------
 
 
-@app.route("/legacy")
-def view_landing_page():
-    """Generates Landing Page in legacy layout."""
-    return render_template("index.html")
+@route("/legacy", methods=["GET"])
+def view_landing_page(req, resp):
+    """Generates the landing page in the classic httpbin manpage layout."""
+    try:
+        resp.html = api.template(
+            "index.html", url_for=url_for, tracking_enabled=TRACKING_ENABLED
+        )
+    except Exception:
+        resp.html = "<h1>responder-httpbin</h1><p>See <a href='/'>the docs</a>.</p>"
 
 
-@app.route("/html")
-def view_html_page():
-    """Returns a simple HTML document.
-    ---
-    tags:
-      - Response formats
-    produces:
-      - text/html
-    responses:
-      200:
-        description: An HTML page.
-    """
-
-    return render_template("moby.html")
+@route("/html", methods=["GET"])
+def view_html_page(req, resp):
+    """Returns a simple HTML document."""
+    resp.html = text_resource("moby.html")
 
 
-@app.route("/robots.txt")
-def view_robots_page():
-    """Returns some robots.txt rules.
-    ---
-    tags:
-      - Response formats
-    produces:
-      - text/plain
-    responses:
-      200:
-        description: Robots file
-    """
-
-    response = make_response()
-    response.data = ROBOT_TXT
-    response.content_type = "text/plain"
-    return response
+@route("/robots.txt", methods=["GET"])
+def view_robots_page(req, resp):
+    """Returns some robots.txt rules."""
+    resp.content = ROBOT_TXT.encode("utf-8")
+    resp.mimetype = "text/plain"
+    resp.encoding = None  # suppress responder's non-standard `Encoding:` header
 
 
-@app.route("/deny")
-def view_deny_page():
-    """Returns page denied by robots.txt rules.
-    ---
-    tags:
-      - Response formats
-    produces:
-      - text/plain
-    responses:
-      200:
-        description: Denied message
-    """
-    response = make_response()
-    response.data = ANGRY_ASCII
-    response.content_type = "text/plain"
-    return response
-    # return "YOU SHOULDN'T BE HERE"
+@route("/deny", methods=["GET"])
+def view_deny_page(req, resp):
+    """Returns page denied by robots.txt rules."""
+    resp.content = ANGRY_ASCII.encode("utf-8")
+    resp.mimetype = "text/plain"
+    resp.encoding = None
 
 
-@app.route("/ip")
-def view_origin():
-    """Returns the requester's IP Address.
-    ---
-    tags:
-      - Request inspection
-    produces:
-      - application/json
-    responses:
-      200:
-        description: The Requester's IP Address.
-    """
-
-    return jsonify(origin=request.headers.get("X-Forwarded-For", request.remote_addr))
+@route("/ip", methods=["GET"])
+def view_origin(req, resp):
+    """Returns the requester's IP Address."""
+    jsonify(resp, origin=req.headers.get("X-Forwarded-For", _remote_addr(req)))
 
 
-@app.route("/uuid")
-def view_uuid():
-    """Return a UUID4.
-    ---
-    tags:
-      - Dynamic data
-    produces:
-      - application/json
-    responses:
-      200:
-        description: A UUID4.
-    """
-
-    return jsonify(uuid=str(uuid.uuid4()))
+def _remote_addr(req):
+    return req.client.host if req.client else None
 
 
-@app.route("/headers")
-def view_headers():
-    """Return the incoming request's HTTP headers.
-    ---
-    tags:
-      - Request inspection
-    produces:
-      - application/json
-    responses:
-      200:
-        description: The request's headers.
-    """
-
-    return jsonify(get_dict('headers'))
+@route("/uuid", methods=["GET"])
+def view_uuid(req, resp):
+    """Return a UUID4."""
+    jsonify(resp, uuid=str(uuid.uuid4()))
 
 
-@app.route("/user-agent")
-def view_user_agent():
-    """Return the incoming requests's User-Agent header.
-    ---
-    tags:
-      - Request inspection
-    produces:
-      - application/json
-    responses:
-      200:
-        description: The request's User-Agent header.
-    """
-
-    headers = get_headers()
-
-    return jsonify({"user-agent": headers["user-agent"]})
+@route("/headers", methods=["GET"])
+def view_headers(req, resp):
+    """Return the incoming request's HTTP headers."""
+    jsonify(resp, headers=get_headers(req))
 
 
-@app.route("/get", methods=("GET",))
-def view_get():
-    """The request's query parameters.
-    ---
-    tags:
-      - HTTP Methods
-    produces:
-      - application/json
-    responses:
-      200:
-        description: The request's query parameters.
-    """
-
-    return jsonify(get_dict("url", "args", "headers", "origin"))
+@route("/user-agent", methods=["GET"])
+def view_user_agent(req, resp):
+    """Return the incoming request's User-Agent header."""
+    headers = get_headers(req)
+    jsonify(resp, {"user-agent": headers.get("User-Agent")})
 
 
-@app.route("/anything", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "TRACE"])
-@app.route(
-    "/anything/<path:anything>",
+@route("/get", methods=["GET"])
+async def view_get(req, resp):
+    """The request's query parameters."""
+    jsonify(resp, await get_dict(req, "url", "args", "headers", "origin"))
+
+
+@route(
+    "/anything",
     methods=["GET", "POST", "PUT", "DELETE", "PATCH", "TRACE"],
+    extra_patterns=("/anything/{anything:path}",),
 )
-def view_anything(anything=None):
-    """Returns anything passed in request data.
-    ---
-    tags:
-      - Anything
-    produces:
-      - application/json
-    responses:
-      200:
-        description: Anything passed in request
-    """
-
-    return jsonify(
-        get_dict(
+async def view_anything(req, resp, *, anything=None):
+    """Returns anything passed in request data."""
+    jsonify(
+        resp,
+        await get_dict(
+            req,
             "url",
             "args",
             "headers",
@@ -407,357 +340,183 @@ def view_anything(anything=None):
             "data",
             "files",
             "json",
-        )
+        ),
     )
 
 
-@app.route("/post", methods=("POST",))
-def view_post():
-    """The request's POST parameters.
-    ---
-    tags:
-      - HTTP Methods
-    produces:
-      - application/json
-    responses:
-      200:
-        description: The request's POST parameters.
-    """
-
-    return jsonify(
-        get_dict("url", "args", "form", "data", "origin", "headers", "files", "json")
+@route("/post", methods=["POST"])
+async def view_post(req, resp):
+    """The request's POST parameters."""
+    jsonify(
+        resp,
+        await get_dict(
+            req, "url", "args", "form", "data", "origin", "headers", "files", "json"
+        ),
     )
 
 
-@app.route("/put", methods=("PUT",))
-def view_put():
-    """The request's PUT parameters.
-    ---
-    tags:
-      - HTTP Methods
-    produces:
-      - application/json
-    responses:
-      200:
-        description: The request's PUT parameters.
-    """
-
-    return jsonify(
-        get_dict("url", "args", "form", "data", "origin", "headers", "files", "json")
+@route("/put", methods=["PUT"])
+async def view_put(req, resp):
+    """The request's PUT parameters."""
+    jsonify(
+        resp,
+        await get_dict(
+            req, "url", "args", "form", "data", "origin", "headers", "files", "json"
+        ),
     )
 
 
-@app.route("/patch", methods=("PATCH",))
-def view_patch():
-    """The request's PATCH parameters.
-    ---
-    tags:
-      - HTTP Methods
-    produces:
-      - application/json
-    responses:
-      200:
-        description: The request's PATCH parameters.
-    """
-
-    return jsonify(
-        get_dict("url", "args", "form", "data", "origin", "headers", "files", "json")
+@route("/patch", methods=["PATCH"])
+async def view_patch(req, resp):
+    """The request's PATCH parameters."""
+    jsonify(
+        resp,
+        await get_dict(
+            req, "url", "args", "form", "data", "origin", "headers", "files", "json"
+        ),
     )
 
 
-@app.route("/delete", methods=("DELETE",))
-def view_delete():
-    """The request's DELETE parameters.
-    ---
-    tags:
-      - HTTP Methods
-    produces:
-      - application/json
-    responses:
-      200:
-        description: The request's DELETE parameters.
-    """
-
-    return jsonify(
-        get_dict("url", "args", "form", "data", "origin", "headers", "files", "json")
+@route("/delete", methods=["DELETE"])
+async def view_delete(req, resp):
+    """The request's DELETE parameters."""
+    jsonify(
+        resp,
+        await get_dict(
+            req, "url", "args", "form", "data", "origin", "headers", "files", "json"
+        ),
     )
 
 
-@app.route("/gzip")
-@filters.gzip
-def view_gzip_encoded_content():
-    """Returns GZip-encoded data.
-    ---
-    tags:
-      - Response formats
-    produces:
-      - application/json
-    responses:
-      200:
-        description: GZip-encoded data.
-    """
-
-    return jsonify(get_dict("origin", "headers", method=request.method, gzipped=True))
+@route("/gzip", methods=["GET"])
+async def view_gzip_encoded_content(req, resp):
+    """Returns GZip-encoded data."""
+    data = await get_dict(req, "origin", "headers", method=str(req.method), gzipped=True)
+    payload = dumps(data).encode("utf-8")
+    resp.content = filters.gzip_compress(payload)
+    resp.mimetype = "application/json"
+    resp.headers["Content-Encoding"] = "gzip"
+    resp.headers["Content-Length"] = str(len(resp.content))
 
 
-@app.route("/deflate")
-@filters.deflate
-def view_deflate_encoded_content():
-    """Returns Deflate-encoded data.
-    ---
-    tags:
-      - Response formats
-    produces:
-      - application/json
-    responses:
-      200:
-        description: Defalte-encoded data.
-    """
-
-    return jsonify(get_dict("origin", "headers", method=request.method, deflated=True))
+@route("/deflate", methods=["GET"])
+async def view_deflate_encoded_content(req, resp):
+    """Returns Deflate-encoded data."""
+    data = await get_dict(req, "origin", "headers", method=str(req.method), deflated=True)
+    payload = dumps(data).encode("utf-8")
+    resp.content = filters.deflate_compress(payload)
+    resp.mimetype = "application/json"
+    resp.headers["Content-Encoding"] = "deflate"
+    resp.headers["Content-Length"] = str(len(resp.content))
 
 
-@app.route("/brotli")
-@filters.brotli
-def view_brotli_encoded_content():
-    """Returns Brotli-encoded data.
-    ---
-    tags:
-      - Response formats
-    produces:
-      - application/json
-    responses:
-      200:
-        description: Brotli-encoded data.
-    """
+@route("/brotli", methods=["GET"])
+async def view_brotli_encoded_content(req, resp):
+    """Returns Brotli-encoded data."""
+    data = await get_dict(req, "origin", "headers", method=str(req.method), brotli=True)
+    payload = dumps(data).encode("utf-8")
+    compressed = filters.brotli_compress(payload)
+    if compressed is None:
+        set_status(resp, 501)
+        resp.content = b"brotli support is not installed (pip install brotli)"
+        resp.mimetype = "text/plain"
+        return
+    resp.content = compressed
+    resp.mimetype = "application/json"
+    resp.headers["Content-Encoding"] = "br"
+    resp.headers["Content-Length"] = str(len(resp.content))
 
-    return jsonify(get_dict("origin", "headers", method=request.method, brotli=True))
 
-
-@app.route("/redirect/<int:n>")
-def redirect_n_times(n):
-    """302 Redirects n times.
-    ---
-    tags:
-      - Redirects
-    parameters:
-      - in: path
-        name: n
-        type: int
-    produces:
-      - text/html
-    responses:
-      302:
-        description: A redirection.
-    """
+@route("/redirect/{n:int}", methods=["GET"])
+def redirect_n_times(req, resp, *, n):
+    """302 Redirects n times."""
     assert n > 0
 
-    absolute = request.args.get("absolute", "false").lower() == "true"
+    absolute = req.params.get("absolute", "false").lower() == "true"
 
+    resp.status_code = 302
     if n == 1:
-        return redirect(url_for("view_get", _external=absolute))
+        resp.headers["Location"] = (host_url(req) + "/get") if absolute else "/get"
+        return
 
     if absolute:
-        return _redirect("absolute", n, True)
+        resp.headers["Location"] = host_url(req) + url_for(
+            "absolute_redirect_n_times", n=n - 1
+        )
     else:
-        return _redirect("relative", n, False)
+        resp.headers["Location"] = url_for("relative_redirect_n_times", n=n - 1)
 
 
-def _redirect(kind, n, external):
-    return redirect(
-        url_for("{0}_redirect_n_times".format(kind), n=n - 1, _external=external)
+@route("/redirect-to", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "TRACE"])
+def redirect_to(req, resp):
+    """302/3XX Redirects to the given URL."""
+    # The original wrapped args in a case-insensitive dict.
+    args = {key.lower(): value for key, value in query_pairs(req)}
+
+    resp.status_code = 302
+    status_code = args.get("status_code")
+    if status_code is not None:
+        code = int(status_code)
+        if 300 <= code < 400:
+            resp.status_code = code
+    # Set the Location header to the exact string supplied (no normalization).
+    # Emit the raw UTF-8 bytes (decoded as latin-1) so non-ASCII URLs don't
+    # crash Starlette's latin-1 header encoder.
+    resp.headers["Location"] = args["url"].encode("utf-8").decode("latin-1")
+
+
+@route("/relative-redirect/{n:int}", methods=["GET"])
+def relative_redirect_n_times(req, resp, *, n):
+    """Relatively 302 Redirects n times."""
+    assert n > 0
+    resp.status_code = 302
+    if n == 1:
+        resp.headers["Location"] = "/get"
+        return
+    resp.headers["Location"] = url_for("relative_redirect_n_times", n=n - 1)
+
+
+@route("/absolute-redirect/{n:int}", methods=["GET"])
+def absolute_redirect_n_times(req, resp, *, n):
+    """Absolutely 302 Redirects n times."""
+    assert n > 0
+    resp.status_code = 302
+    if n == 1:
+        resp.headers["Location"] = host_url(req) + "/get"
+        return
+    resp.headers["Location"] = host_url(req) + url_for(
+        "absolute_redirect_n_times", n=n - 1
     )
 
 
-@app.route("/redirect-to", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "TRACE"])
-def redirect_to():
-    """302/3XX Redirects to the given URL.
-    ---
-    tags:
-      - Redirects
-    produces:
-      - text/html
-    get:
-      parameters:
-        - in: query
-          name: url
-          type: string
-          required: true
-        - in: query
-          name: status_code
-          type: int
-    post:
-      consumes:
-        - application/x-www-form-urlencoded
-      parameters:
-        - in: formData
-          name: url
-          type: string
-          required: true
-        - in: formData
-          name: status_code
-          type: int
-          required: false
-    patch:
-      consumes:
-        - application/x-www-form-urlencoded
-      parameters:
-        - in: formData
-          name: url
-          type: string
-          required: true
-        - in: formData
-          name: status_code
-          type: int
-          required: false
-    put:
-      consumes:
-        - application/x-www-form-urlencoded
-      parameters:
-        - in: formData
-          name: url
-          type: string
-          required: true
-        - in: formData
-          name: status_code
-          type: int
-          required: false
-    responses:
-      302:
-        description: A redirection.
-    """
-
-    args_dict = request.args.items()
-    args = CaseInsensitiveDict(args_dict)
-
-    # We need to build the response manually and convert to UTF-8 to prevent
-    # werkzeug from "fixing" the URL. This endpoint should set the Location
-    # header to the exact string supplied.
-    response = app.make_response("")
-    response.status_code = 302
-    if "status_code" in args:
-        status_code = int(args["status_code"])
-        if status_code >= 300 and status_code < 400:
-            response.status_code = status_code
-    response.headers["Location"] = args["url"].encode("utf-8")
-
-    return response
-
-
-@app.route("/relative-redirect/<int:n>")
-def relative_redirect_n_times(n):
-    """Relatively 302 Redirects n times.
-    ---
-    tags:
-      - Redirects
-    parameters:
-      - in: path
-        name: n
-        type: int
-    produces:
-      - text/html
-    responses:
-      302:
-        description: A redirection.
-    """
-
-    assert n > 0
-
-    response = app.make_response("")
-    response.status_code = 302
-
-    if n == 1:
-        response.headers["Location"] = url_for("view_get")
-        return response
-
-    response.headers["Location"] = url_for("relative_redirect_n_times", n=n - 1)
-    return response
-
-
-@app.route("/absolute-redirect/<int:n>")
-def absolute_redirect_n_times(n):
-    """Absolutely 302 Redirects n times.
-    ---
-    tags:
-      - Redirects
-    parameters:
-      - in: path
-        name: n
-        type: int
-    produces:
-      - text/html
-    responses:
-      302:
-        description: A redirection.
-    """
-
-    assert n > 0
-
-    if n == 1:
-        return redirect(url_for("view_get", _external=True))
-
-    return _redirect("absolute", n, True)
-
-
-@app.route("/stream/<int:n>")
-def stream_n_messages(n):
-    """Stream n JSON responses
-    ---
-    tags:
-      - Dynamic data
-    parameters:
-      - in: path
-        name: n
-        type: int
-    produces:
-      - application/json
-    responses:
-      200:
-        description: Streamed JSON responses.
-    """
-    response = get_dict("url", "args", "headers", "origin")
+@route("/stream/{n:int}", methods=["GET"])
+async def stream_n_messages(req, resp, *, n):
+    """Stream n JSON responses."""
+    data = await get_dict(req, "url", "args", "headers", "origin")
     n = min(n, 100)
+    resp.mimetype = "application/json"
 
-    def generate_stream():
+    @resp.stream
+    async def body():
         for i in range(n):
-            response["id"] = i
-            yield json.dumps(response) + "\n"
+            data["id"] = i
+            # Compact, insertion-order JSON lines (matches the original /stream).
+            yield (json.dumps(data) + "\n").encode("utf-8")
 
-    return Response(generate_stream(), headers={"Content-Type": "application/json"})
 
-
-@app.route(
-    "/status/<codes>", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "TRACE"]
-)
-def view_status_code(codes):
-    """Return status code or random status code if more than one are given
-    ---
-    tags:
-      - Status codes
-    parameters:
-      - in: path
-        name: codes
-    produces:
-      - text/plain
-    responses:
-      100:
-        description: Informational responses
-      200:
-        description: Success
-      300:
-        description: Redirection
-      400:
-        description: Client Errors
-      500:
-        description: Server Errors
-    """
-
+@route("/status/{codes}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "TRACE"])
+def view_status_code(req, resp, *, codes):
+    """Return status code or random status code if more than one are given."""
     if "," not in codes:
         try:
             code = int(codes)
         except ValueError:
-            return Response("Invalid status code", status=400)
-        return status_code(code)
+            resp.status_code = 400
+            resp.content = b"Invalid status code"
+            resp.mimetype = "text/html; charset=utf-8"
+            return
+        set_status(resp, code)
+        return
 
     choices = []
     for choice in codes.split(","):
@@ -766,366 +525,149 @@ def view_status_code(codes):
             weight = 1
         else:
             code, weight = choice.split(":")
-
         try:
             choices.append((int(code), float(weight)))
         except ValueError:
-            return Response("Invalid status code", status=400)
+            resp.status_code = 400
+            resp.content = b"Invalid status code"
+            resp.mimetype = "text/html; charset=utf-8"
+            return
 
-    code = weighted_choice(choices)
-
-    return status_code(code)
+    set_status(resp, weighted_choice(choices))
 
 
-@app.route("/response-headers", methods=["GET", "POST"])
-def response_headers():
-    """Returns a set of response headers from the query string.
-    ---
-    tags:
-      - Response inspection
-    parameters:
-      - in: query
-        name: freeform
-        explode: true
-        allowEmptyValue: true
-        schema:
-          type: object
-          additionalProperties:
-            type: string
-        style: form
-    produces:
-      - application/json
-    responses:
-      200:
-        description: Response headers
-    """
-    # Pending swaggerUI update
-    # https://github.com/swagger-api/swagger-ui/issues/3850
-    headers = MultiDict(request.args.items(multi=True))
-    response = jsonify(list(headers.lists()))
+@route("/response-headers", methods=["GET", "POST"])
+def response_headers(req, resp):
+    """Returns a set of response headers from the query string."""
+    multi = query_multi(req)
 
-    while True:
-        original_data = response.data
+    # responder's response headers are a plain dict (no repeated keys), so we
+    # collapse repeated query values into an RFC 7230 comma-joined list.
+    for key, values in multi.items():
+        resp.headers[key] = ",".join(values)
+
+    def body_dict(content_length=None):
         d = {}
-        for key in response.headers.keys():
-            value = response.headers.get_all(key)
-            if len(value) == 1:
-                value = value[0]
-            d[key] = value
-        response = jsonify(d)
-        for key, value in headers.items(multi=True):
-            response.headers.add(key, value)
-        response_has_changed = response.data != original_data
-        if not response_has_changed:
+        for key, values in multi.items():
+            d[key] = values[0] if len(values) == 1 else values
+        d["Content-Type"] = "application/json"
+        if content_length is not None:
+            d["Content-Length"] = str(content_length)
+        return d
+
+    body = dumps(body_dict())
+    for _ in range(10):  # fixed-point on the self-referential Content-Length
+        candidate = dumps(body_dict(len(body.encode("utf-8"))))
+        if candidate == body:
             break
-    return response
+        body = candidate
+
+    encoded = body.encode("utf-8")
+    resp.content = encoded
+    resp.mimetype = "application/json"
+    resp.headers["Content-Length"] = str(len(encoded))
 
 
-@app.route("/cookies")
-def view_cookies(hide_env=True):
-    """Returns cookie data.
-    ---
-    tags:
-      - Cookies
-    produces:
-      - application/json
-    responses:
-      200:
-        description: Set cookies.
-    """
+def _set_cookie(resp, key, value="", **extra):
+    """set_cookie with Flask's old defaults (plain, JS-readable cookies)."""
+    resp.set_cookie(key, value=value, httponly=False, samesite=None, **extra)
 
-    cookies = dict(request.cookies.items())
 
-    if hide_env and ("show_env" not in request.args):
+@route("/cookies", methods=["GET"])
+def view_cookies(req, resp, hide_env=True):
+    """Returns cookie data."""
+    cookies = dict(req.cookies.items())
+    if hide_env and not query_has(req, "show_env"):
         for key in ENV_COOKIES:
-            try:
-                del cookies[key]
-            except KeyError:
-                pass
-
-    return jsonify(cookies=cookies)
+            cookies.pop(key, None)
+    jsonify(resp, cookies=cookies)
 
 
-@app.route("/forms/post")
-def view_forms_post():
+@route("/forms/post", methods=["GET"])
+def view_forms_post(req, resp):
     """Simple HTML form."""
-
-    return render_template("forms-post.html")
-
-
-@app.route("/cookies/set/<name>/<value>")
-def set_cookie(name, value):
-    """Sets a cookie and redirects to cookie list.
-    ---
-    tags:
-      - Cookies
-    parameters:
-      - in: path
-        name: name
-        type: string
-      - in: path
-        name: value
-        type: string
-    produces:
-      - text/plain
-    responses:
-      200:
-        description: Set cookies and redirects to cookie list.
-    """
-
-    r = app.make_response(redirect(url_for("view_cookies")))
-    r.set_cookie(key=name, value=value, secure=secure_cookie())
-
-    return r
+    resp.html = text_resource("forms-post.html")
 
 
-@app.route("/cookies/set")
-def set_cookies():
-    """Sets cookie(s) as provided by the query string and redirects to cookie list.
-    ---
-    tags:
-      - Cookies
-    parameters:
-      - in: query
-        name: freeform
-        explode: true
-        allowEmptyValue: true
-        schema:
-          type: object
-          additionalProperties:
-            type: string
-        style: form
-    produces:
-      - text/plain
-    responses:
-      200:
-        description: Redirect to cookie list
-    """
-
-    cookies = dict(request.args.items())
-    r = app.make_response(redirect(url_for("view_cookies")))
-    for key, value in cookies.items():
-        r.set_cookie(key=key, value=value, secure=secure_cookie())
-
-    return r
+@route("/cookies/set/{name}/{value}", methods=["GET"])
+def set_cookie(req, resp, *, name, value):
+    """Sets a cookie and redirects to the cookie list."""
+    resp.status_code = 302
+    resp.headers["Location"] = url_for("view_cookies")
+    _set_cookie(resp, name, value=value, secure=secure_cookie(req))
 
 
-@app.route("/cookies/delete")
-def delete_cookies():
-    """Deletes cookie(s) as provided by the query string and redirects to cookie list.
-    ---
-    tags:
-      - Cookies
-    parameters:
-      - in: query
-        name: freeform
-        explode: true
-        allowEmptyValue: true
-        schema:
-          type: object
-          additionalProperties:
-            type: string
-        style: form
-    produces:
-      - text/plain
-    responses:
-      200:
-        description: Redirect to cookie list
-    """
-
-    cookies = dict(request.args.items())
-    r = app.make_response(redirect(url_for("view_cookies")))
-    for key, value in cookies.items():
-        r.delete_cookie(key=key)
-
-    return r
+@route("/cookies/set", methods=["GET"])
+def set_cookies(req, resp):
+    """Sets cookie(s) as provided by the query string and redirects to cookie list."""
+    resp.status_code = 302
+    resp.headers["Location"] = url_for("view_cookies")
+    for key, value in query_pairs(req):
+        _set_cookie(resp, key, value=value, secure=secure_cookie(req))
 
 
-@app.route("/basic-auth/<user>/<passwd>")
-def basic_auth(user="user", passwd="passwd"):
-    """Prompts the user for authorization using HTTP Basic Auth.
-    ---
-    tags:
-      - Auth
-    parameters:
-      - in: path
-        name: user
-        type: string
-      - in: path
-        name: passwd
-        type: string
-    produces:
-      - application/json
-    responses:
-      200:
-        description: Sucessful authentication.
-      401:
-        description: Unsuccessful authentication.
-    """
-
-    if not check_basic_auth(user, passwd):
-        return status_code(401)
-
-    return jsonify(authenticated=True, user=user)
+@route("/cookies/delete", methods=["GET"])
+def delete_cookies(req, resp):
+    """Deletes cookie(s) as provided by the query string and redirects to cookie list."""
+    resp.status_code = 302
+    resp.headers["Location"] = url_for("view_cookies")
+    for key, _value in query_pairs(req):
+        _set_cookie(
+            resp, key, value="", max_age=0, expires="Thu, 01 Jan 1970 00:00:00 GMT"
+        )
 
 
-@app.route("/hidden-basic-auth/<user>/<passwd>")
-def hidden_basic_auth(user="user", passwd="passwd"):
-    """Prompts the user for authorization using HTTP Basic Auth.
-    ---
-    tags:
-      - Auth
-    parameters:
-      - in: path
-        name: user
-        type: string
-      - in: path
-        name: passwd
-        type: string
-    produces:
-      - application/json
-    responses:
-      200:
-        description: Sucessful authentication.
-      404:
-        description: Unsuccessful authentication.
-    """
-
-    if not check_basic_auth(user, passwd):
-        return status_code(404)
-    return jsonify(authenticated=True, user=user)
+@route("/basic-auth/{user}/{passwd}", methods=["GET"])
+def basic_auth(req, resp, *, user, passwd):
+    """Prompts the user for authorization using HTTP Basic Auth."""
+    if not check_basic_auth(req, user, passwd):
+        set_status(resp, 401)
+        return
+    jsonify(resp, authenticated=True, user=user)
 
 
-@app.route("/bearer")
-def bearer_auth():
-    """Prompts the user for authorization using bearer authentication.
-    ---
-    tags:
-      - Auth
-    parameters:
-      - in: header
-        name: Authorization
-        schema:
-          type: string
-    produces:
-      - application/json
-    responses:
-      200:
-        description: Sucessful authentication.
-      401:
-        description: Unsuccessful authentication.
-    """
-    authorization = request.headers.get("Authorization")
+@route("/hidden-basic-auth/{user}/{passwd}", methods=["GET"])
+def hidden_basic_auth(req, resp, *, user, passwd):
+    """Prompts the user for authorization using HTTP Basic Auth, 404 on failure."""
+    if not check_basic_auth(req, user, passwd):
+        set_status(resp, 404)
+        return
+    jsonify(resp, authenticated=True, user=user)
+
+
+@route("/bearer", methods=["GET"])
+def bearer_auth(req, resp):
+    """Prompts the user for authorization using bearer authentication."""
+    authorization = req.headers.get("Authorization")
     if not (authorization and authorization.startswith("Bearer ")):
-        response = app.make_response("")
-        response.headers["WWW-Authenticate"] = "Bearer"
-        response.status_code = 401
-        return response
-    slice_start = len("Bearer ")
-    token = authorization[slice_start:]
-
-    return jsonify(authenticated=True, token=token)
+        resp.status_code = 401
+        resp.headers["WWW-Authenticate"] = "Bearer"
+        resp.content = b""
+        return
+    token = authorization[len("Bearer ") :]
+    jsonify(resp, authenticated=True, token=token)
 
 
-@app.route("/digest-auth/<qop>/<user>/<passwd>")
-def digest_auth_md5(qop=None, user="user", passwd="passwd"):
-    """Prompts the user for authorization using Digest Auth.
-    ---
-    tags:
-      - Auth
-    parameters:
-      - in: path
-        name: qop
-        type: string
-        description: auth or auth-int
-      - in: path
-        name: user
-        type: string
-      - in: path
-        name: passwd
-        type: string
-    produces:
-      - application/json
-    responses:
-      200:
-        description: Sucessful authentication.
-      401:
-        description: Unsuccessful authentication.
-    """
-    return digest_auth(qop, user, passwd, "MD5", "never")
+@route("/digest-auth/{qop}/{user}/{passwd}", methods=["GET"])
+async def digest_auth_md5(req, resp, *, qop, user, passwd):
+    """Prompts the user for authorization using Digest Auth."""
+    await _digest_auth(req, resp, qop, user, passwd, "MD5", "never")
 
 
-@app.route("/digest-auth/<qop>/<user>/<passwd>/<algorithm>")
-def digest_auth_nostale(qop=None, user="user", passwd="passwd", algorithm="MD5"):
-    """Prompts the user for authorization using Digest Auth + Algorithm.
-    ---
-    tags:
-      - Auth
-    parameters:
-      - in: path
-        name: qop
-        type: string
-        description: auth or auth-int
-      - in: path
-        name: user
-        type: string
-      - in: path
-        name: passwd
-        type: string
-      - in: path
-        name: algorithm
-        type: string
-        description: MD5, SHA-256, SHA-512
-        default: MD5
-    produces:
-      - application/json
-    responses:
-      200:
-        description: Sucessful authentication.
-      401:
-        description: Unsuccessful authentication.
-    """
-    return digest_auth(qop, user, passwd, algorithm, "never")
+@route("/digest-auth/{qop}/{user}/{passwd}/{algorithm}", methods=["GET"])
+async def digest_auth_nostale(req, resp, *, qop, user, passwd, algorithm):
+    """Prompts the user for authorization using Digest Auth + Algorithm."""
+    await _digest_auth(req, resp, qop, user, passwd, algorithm, "never")
 
 
-@app.route("/digest-auth/<qop>/<user>/<passwd>/<algorithm>/<stale_after>")
-def digest_auth(
-    qop=None, user="user", passwd="passwd", algorithm="MD5", stale_after="never"
-):
-    """Prompts the user for authorization using Digest Auth + Algorithm.
-    allow settings the stale_after argument.
-    ---
-    tags:
-      - Auth
-    parameters:
-      - in: path
-        name: qop
-        type: string
-        description: auth or auth-int
-      - in: path
-        name: user
-        type: string
-      - in: path
-        name: passwd
-        type: string
-      - in: path
-        name: algorithm
-        type: string
-        description: MD5, SHA-256, SHA-512
-        default: MD5
-      - in: path
-        name: stale_after
-        type: string
-        default: never
-    produces:
-      - application/json
-    responses:
-      200:
-        description: Sucessful authentication.
-      401:
-        description: Unsuccessful authentication.
-    """
-    require_cookie_handling = request.args.get("require-cookie", "").lower() in (
+@route("/digest-auth/{qop}/{user}/{passwd}/{algorithm}/{stale_after}", methods=["GET"])
+async def digest_auth(req, resp, *, qop, user, passwd, algorithm, stale_after):
+    """Prompts the user for authorization using Digest Auth + Algorithm, with stale_after."""
+    await _digest_auth(req, resp, qop, user, passwd, algorithm, stale_after)
+
+
+async def _digest_auth(req, resp, qop, user, passwd, algorithm, stale_after):
+    require_cookie_handling = req.params.get("require-cookie", "").lower() in (
         "1",
         "t",
         "true",
@@ -1136,7 +678,7 @@ def digest_auth(
     if qop not in ("auth", "auth-int"):
         qop = None
 
-    authorization = request.headers.get("Authorization")
+    authorization = req.headers.get("Authorization")
     credentials = None
     if authorization:
         credentials = parse_authorization_header(authorization)
@@ -1145,381 +687,210 @@ def digest_auth(
         not authorization
         or not credentials
         or credentials.type.lower() != "digest"
-        or (require_cookie_handling and "Cookie" not in request.headers)
+        or (require_cookie_handling and "Cookie" not in req.headers)
     ):
-        response = digest_challenge_response(app, qop, algorithm)
-        response.set_cookie("stale_after", value=stale_after)
-        response.set_cookie("fake", value="fake_value")
-        return response
+        _digest_challenge(req, resp, qop, algorithm)
+        _set_cookie(resp, "stale_after", value=stale_after)
+        _set_cookie(resp, "fake", value="fake_value")
+        return
 
-    if require_cookie_handling and request.cookies.get("fake") != "fake_value":
-        response = jsonify({"errors": ["missing cookie set on challenge"]})
-        response.set_cookie("fake", value="fake_value")
-        response.status_code = 403
-        return response
+    if require_cookie_handling and req.cookies.get("fake") != "fake_value":
+        jsonify(resp, {"errors": ["missing cookie set on challenge"]})
+        _set_cookie(resp, "fake", value="fake_value")
+        resp.status_code = 403
+        return
 
     current_nonce = credentials.get("nonce")
 
     stale_after_value = None
-    if "stale_after" in request.cookies:
-        stale_after_value = request.cookies.get("stale_after")
+    if "stale_after" in req.cookies:
+        stale_after_value = req.cookies.get("stale_after")
 
     if (
-        "last_nonce" in request.cookies
-        and current_nonce == request.cookies.get("last_nonce")
+        "last_nonce" in req.cookies
+        and current_nonce == req.cookies.get("last_nonce")
         or stale_after_value == "0"
     ):
-        response = digest_challenge_response(app, qop, algorithm, True)
-        response.set_cookie("stale_after", value=stale_after)
-        response.set_cookie("last_nonce", value=current_nonce)
-        response.set_cookie("fake", value="fake_value")
-        return response
+        _digest_challenge(req, resp, qop, algorithm, True)
+        _set_cookie(resp, "stale_after", value=stale_after)
+        _set_cookie(resp, "last_nonce", value=current_nonce)
+        _set_cookie(resp, "fake", value="fake_value")
+        return
 
-    if not check_digest_auth(user, passwd):
-        response = digest_challenge_response(app, qop, algorithm, False)
-        response.set_cookie("stale_after", value=stale_after)
-        response.set_cookie("last_nonce", value=current_nonce)
-        response.set_cookie("fake", value="fake_value")
-        return response
+    body = await req.content
+    if not check_digest_auth(req, user, passwd, body):
+        _digest_challenge(req, resp, qop, algorithm, False)
+        _set_cookie(resp, "stale_after", value=stale_after)
+        _set_cookie(resp, "last_nonce", value=current_nonce)
+        _set_cookie(resp, "fake", value="fake_value")
+        return
 
-    response = jsonify(authenticated=True, user=user)
-    response.set_cookie("fake", value="fake_value")
+    jsonify(resp, authenticated=True, user=user)
+    _set_cookie(resp, "fake", value="fake_value")
     if stale_after_value:
-        response.set_cookie(
-            "stale_after", value=next_stale_after_value(stale_after_value)
-        )
-
-    return response
+        _set_cookie(resp, "stale_after", value=next_stale_after_value(stale_after_value))
 
 
-@app.route("/delay/<delay>", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "TRACE"])
-def delay_response(delay):
-    """Returns a delayed response (max of 10 seconds).
-    ---
-    tags:
-      - Dynamic data
-    parameters:
-      - in: path
-        name: delay
-        type: int
-    produces:
-      - application/json
-    responses:
-      200:
-        description: A delayed response.
-    """
-    delay = min(float(delay), 10)
-
-    time.sleep(delay)
-
-    return jsonify(
-        get_dict("url", "args", "form", "data", "origin", "headers", "files")
+def _digest_challenge(req, resp, qop, algorithm, stale=False):
+    resp.status_code = 401
+    resp.content = b""
+    resp.headers["WWW-Authenticate"] = digest_challenge_header(
+        req, qop, algorithm, stale
     )
 
 
-@app.route("/drip")
-def drip():
-    """Drips data over a duration after an optional initial delay.
-    ---
-    tags:
-      - Dynamic data
-    parameters:
-      - in: query
-        name: duration
-        type: number
-        description: The amount of time (in seconds) over which to drip each byte
-        default: 2
-        required: false
-      - in: query
-        name: numbytes
-        type: integer
-        description: The number of bytes to respond with
-        default: 10
-        required: false
-      - in: query
-        name: code
-        type: integer
-        description: The response code that will be returned
-        default: 200
-        required: false
-      - in: query
-        name: delay
-        type: number
-        description: The amount of time (in seconds) to delay before responding
-        default: 2
-        required: false
-    produces:
-      - application/octet-stream
-    responses:
-      200:
-        description: A dripped response.
-    """
-    args = CaseInsensitiveDict(request.args.items())
-    duration = float(args.get("duration", 2))
-    numbytes = min(int(args.get("numbytes", 10)), (10 * 1024 * 1024))  # set 10MB limit
-    code = int(args.get("code", 200))
+@route("/delay/{delay}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "TRACE"])
+async def delay_response(req, resp, *, delay):
+    """Returns a delayed response (max of 10 seconds)."""
+    delay = min(float(delay), 10)
+    await asyncio.sleep(delay)
+    jsonify(
+        resp,
+        await get_dict(req, "url", "args", "form", "data", "origin", "headers", "files"),
+    )
+
+
+@route("/drip", methods=["GET"])
+async def drip(req, resp):
+    """Drips data over a duration after an optional initial delay."""
+    duration = float(req.params.get("duration", 2))
+    numbytes = min(int(req.params.get("numbytes", 10)), 10 * 1024 * 1024)
+    code = int(req.params.get("code", 200))
 
     if numbytes <= 0:
-        response = Response("number of bytes must be positive", status=400)
-        return response
+        resp.status_code = 400
+        resp.content = b"number of bytes must be positive"
+        resp.mimetype = "text/html; charset=utf-8"
+        return
 
-    delay = float(args.get("delay", 0))
+    delay = float(req.params.get("delay", 0))
     if delay > 0:
-        time.sleep(delay)
+        await asyncio.sleep(delay)
 
     pause = duration / numbytes
 
-    def generate_bytes():
-        for i in xrange(numbytes):
+    resp.status_code = code
+    resp.mimetype = "application/octet-stream"
+    resp.headers["Content-Length"] = str(numbytes)
+
+    @resp.stream
+    async def body():
+        for _ in range(numbytes):
             yield b"*"
-            time.sleep(pause)
-
-    response = Response(
-        generate_bytes(),
-        headers={
-            "Content-Type": "application/octet-stream",
-            "Content-Length": str(numbytes),
-        },
-    )
-
-    response.status_code = code
-
-    return response
+            await asyncio.sleep(pause)
 
 
-@app.route("/base64/<value>")
-def decode_base64(value):
-    """Decodes base64url-encoded string.
-    ---
-    tags:
-      - Dynamic data
-    parameters:
-      - in: path
-        name: value
-        type: string
-        default: SFRUUEJJTiBpcyBhd2Vzb21l
-    produces:
-      - text/html
-    responses:
-      200:
-        description: Decoded base64 content.
-    """
-    encoded = value.encode("utf-8")  # base64 expects binary string as input
+@route("/base64/{value}", methods=["GET"])
+def decode_base64(req, resp, *, value):
+    """Decodes base64url-encoded string."""
+    encoded = value.encode("utf-8")
     try:
-        return base64.urlsafe_b64decode(encoded).decode("utf-8")
-    except:
-        return "Incorrect Base64 data try: SFRUUEJJTiBpcyBhd2Vzb21l"
+        decoded = base64.urlsafe_b64decode(encoded).decode("utf-8")
+    except Exception:
+        decoded = "Incorrect Base64 data try: SFRUUEJJTiBpcyBhd2Vzb21l"
+    # Flask returned a bare str -> text/html; charset=utf-8.
+    resp.content = decoded.encode("utf-8")
+    resp.headers["Content-Type"] = "text/html; charset=utf-8"
 
 
-@app.route("/cache", methods=("GET",))
-def cache():
-    """Returns a 304 if an If-Modified-Since header or If-None-Match is present. Returns the same as a GET otherwise.
-    ---
-    tags:
-      - Response inspection
-    parameters:
-      - in: header
-        name: If-Modified-Since
-      - in: header
-        name: If-None-Match
-    produces:
-      - application/json
-    responses:
-      200:
-        description: Cached response
-      304:
-        description: Modified
-
-    """
-    is_conditional = request.headers.get("If-Modified-Since") or request.headers.get(
+@route("/cache", methods=["GET"])
+async def cache(req, resp):
+    """Returns a 304 if If-Modified-Since or If-None-Match is present; otherwise a normal GET."""
+    is_conditional = req.headers.get("If-Modified-Since") or req.headers.get(
         "If-None-Match"
     )
-
     if is_conditional is None:
-        response = view_get()
-        response.headers["Last-Modified"] = http_date()
-        response.headers["ETag"] = uuid.uuid4().hex
-        return response
+        jsonify(resp, await get_dict(req, "url", "args", "headers", "origin"))
+        resp.headers["Last-Modified"] = http_date()
+        resp.headers["ETag"] = uuid.uuid4().hex
     else:
-        return status_code(304)
+        set_status(resp, 304)
 
 
-@app.route("/etag/<etag>", methods=("GET",))
-def etag(etag):
-    """Assumes the resource has the given etag and responds to If-None-Match and If-Match headers appropriately.
-    ---
-    tags:
-      - Response inspection
-    parameters:
-      - in: header
-        name: If-None-Match
-      - in: header
-        name: If-Match
-    produces:
-      - application/json
-    responses:
-      200:
-        description: Normal response
-      412:
-        description: match
-
-    """
-    if_none_match = parse_multi_value_header(request.headers.get("If-None-Match"))
-    if_match = parse_multi_value_header(request.headers.get("If-Match"))
+@route("/etag/{etag}", methods=["GET"])
+async def etag(req, resp, *, etag):
+    """Responds to If-None-Match / If-Match conditional headers for the given etag."""
+    if_none_match = parse_multi_value_header(req.headers.get("If-None-Match"))
+    if_match = parse_multi_value_header(req.headers.get("If-Match"))
 
     if if_none_match:
         if etag in if_none_match or "*" in if_none_match:
-            response = status_code(304)
-            response.headers["ETag"] = etag
-            return response
+            set_status(resp, 304)
+            resp.headers["ETag"] = etag
+            return
     elif if_match:
         if etag not in if_match and "*" not in if_match:
-            return status_code(412)
+            set_status(resp, 412)
+            return
 
-    # Special cases don't apply, return normal response
-    response = view_get()
-    response.headers["ETag"] = etag
-    return response
-
-
-@app.route("/cache/<int:value>")
-def cache_control(value):
-    """Sets a Cache-Control header for n seconds.
-    ---
-    tags:
-      - Response inspection
-    parameters:
-      - in: path
-        name: value
-        type: integer
-    produces:
-      - application/json
-    responses:
-      200:
-        description: Cache control set
-    """
-    response = view_get()
-    response.headers["Cache-Control"] = "public, max-age={0}".format(value)
-    return response
+    jsonify(resp, await get_dict(req, "url", "args", "headers", "origin"))
+    resp.headers["ETag"] = etag
 
 
-@app.route("/encoding/utf8")
-def encoding():
-    """Returns a UTF-8 encoded body.
-    ---
-    tags:
-      - Response formats
-    produces:
-      - text/html
-    responses:
-      200:
-        description: Encoded UTF-8 content.
-    """
-
-    return render_template("UTF-8-demo.txt")
+@route("/cache/{value:int}", methods=["GET"])
+async def cache_control(req, resp, *, value):
+    """Sets a Cache-Control header for n seconds."""
+    jsonify(resp, await get_dict(req, "url", "args", "headers", "origin"))
+    resp.headers["Cache-Control"] = "public, max-age={0}".format(value)
 
 
-@app.route("/bytes/<int:n>")
-def random_bytes(n):
-    """Returns n random bytes generated with given seed
-    ---
-    tags:
-      - Dynamic data
-    parameters:
-      - in: path
-        name: n
-        type: int
-    produces:
-      - application/octet-stream
-    responses:
-      200:
-        description: Bytes.
-    """
-
-    n = min(n, 100 * 1024)  # set 100KB limit
-
-    params = CaseInsensitiveDict(request.args.items())
-    if "seed" in params:
-        random.seed(int(params["seed"]))
-
-    response = make_response()
-
-    # Note: can't just use os.urandom here because it ignores the seed
-    response.data = bytearray(random.randint(0, 255) for i in range(n))
-    response.content_type = "application/octet-stream"
-    return response
+@route("/encoding/utf8", methods=["GET"])
+def encoding(req, resp):
+    """Returns a UTF-8 encoded body."""
+    resp.content = resource("UTF-8-demo.txt")
+    resp.mimetype = "text/html; charset=utf-8"
 
 
-@app.route("/stream-bytes/<int:n>")
-def stream_random_bytes(n):
-    """Streams n random bytes generated with given seed, at given chunk size per packet.
-    ---
-    tags:
-      - Dynamic data
-    parameters:
-      - in: path
-        name: n
-        type: int
-    produces:
-      - application/octet-stream
-    responses:
-      200:
-        description: Bytes.
-    """
-    n = min(n, 100 * 1024)  # set 100KB limit
+@route("/bytes/{n:int}", methods=["GET"])
+def random_bytes(req, resp, *, n):
+    """Returns n random bytes generated with given seed."""
+    n = min(n, 100 * 1024)  # 100KB limit
 
-    params = CaseInsensitiveDict(request.args.items())
-    if "seed" in params:
-        random.seed(int(params["seed"]))
+    if "seed" in req.params:
+        random.seed(int(req.params["seed"]))
 
-    if "chunk_size" in params:
-        chunk_size = max(1, int(params["chunk_size"]))
+    resp.content = bytes(bytearray(random.randint(0, 255) for _ in range(n)))
+    resp.mimetype = "application/octet-stream"
+
+
+@route("/stream-bytes/{n:int}", methods=["GET"])
+async def stream_random_bytes(req, resp, *, n):
+    """Streams n random bytes generated with given seed, at given chunk size per packet."""
+    n = min(n, 100 * 1024)  # 100KB limit
+
+    if "seed" in req.params:
+        random.seed(int(req.params["seed"]))
+
+    if "chunk_size" in req.params:
+        chunk_size = max(1, int(req.params["chunk_size"]))
     else:
         chunk_size = 10 * 1024
 
-    def generate_bytes():
-        chunks = bytearray()
+    resp.mimetype = "application/octet-stream"
 
-        for i in xrange(n):
+    @resp.stream
+    async def body():
+        chunks = bytearray()
+        for _ in range(n):
             chunks.append(random.randint(0, 255))
             if len(chunks) == chunk_size:
-                yield (bytes(chunks))
+                yield bytes(chunks)
                 chunks = bytearray()
-
         if chunks:
-            yield (bytes(chunks))
-
-    headers = {"Content-Type": "application/octet-stream"}
-
-    return Response(generate_bytes(), headers=headers)
+            yield bytes(chunks)
 
 
-@app.route("/range/<int:numbytes>")
-def range_request(numbytes):
-    """Streams n random bytes generated with given seed, at given chunk size per packet.
-    ---
-    tags:
-      - Dynamic data
-    parameters:
-      - in: path
-        name: numbytes
-        type: int
-    produces:
-      - application/octet-stream
-    responses:
-      200:
-        description: Bytes.
-    """
-
+@route("/range/{numbytes:int}", methods=["GET"])
+async def range_request(req, resp, *, numbytes):
+    """Streams numbytes bytes, honoring a Range header to select a subset."""
     if numbytes <= 0 or numbytes > (100 * 1024):
-        response = Response(
-            headers={"ETag": "range%d" % numbytes, "Accept-Ranges": "bytes"}
-        )
-        response.status_code = 404
-        response.data = "number of bytes must be in the range (0, 102400]"
-        return response
+        resp.status_code = 404
+        resp.content = b"number of bytes must be in the range (0, 102400]"
+        resp.headers["ETag"] = "range%d" % numbytes
+        resp.headers["Accept-Ranges"] = "bytes"
+        return
 
-    params = CaseInsensitiveDict(request.args.items())
+    params = req.params
     if "chunk_size" in params:
         chunk_size = max(1, int(params["chunk_size"]))
     else:
@@ -1528,237 +899,137 @@ def range_request(numbytes):
     duration = float(params.get("duration", 0))
     pause_per_byte = duration / numbytes
 
-    request_headers = get_headers()
-    first_byte_pos, last_byte_pos = get_request_range(request_headers, numbytes)
+    first_byte_pos, last_byte_pos = get_request_range(req.headers, numbytes)
     range_length = (last_byte_pos + 1) - first_byte_pos
 
     if (
         first_byte_pos > last_byte_pos
-        or first_byte_pos not in xrange(0, numbytes)
-        or last_byte_pos not in xrange(0, numbytes)
+        or first_byte_pos not in range(0, numbytes)
+        or last_byte_pos not in range(0, numbytes)
     ):
-        response = Response(
-            headers={
-                "ETag": "range%d" % numbytes,
-                "Accept-Ranges": "bytes",
-                "Content-Range": "bytes */%d" % numbytes,
-                "Content-Length": "0",
-            }
-        )
-        response.status_code = 416
-        return response
+        resp.status_code = 416
+        resp.headers["ETag"] = "range%d" % numbytes
+        resp.headers["Accept-Ranges"] = "bytes"
+        resp.headers["Content-Range"] = "bytes */%d" % numbytes
+        resp.headers["Content-Length"] = "0"
+        resp.content = b""
+        return
 
-    def generate_bytes():
+    resp.mimetype = "application/octet-stream"
+    resp.headers["ETag"] = "range%d" % numbytes
+    resp.headers["Accept-Ranges"] = "bytes"
+    resp.headers["Content-Length"] = str(range_length)
+    resp.headers["Content-Range"] = "bytes %d-%d/%d" % (
+        first_byte_pos,
+        last_byte_pos,
+        numbytes,
+    )
+    resp.status_code = 200 if (
+        first_byte_pos == 0 and last_byte_pos == (numbytes - 1)
+    ) else 206
+
+    @resp.stream
+    async def body():
         chunks = bytearray()
-
-        for i in xrange(first_byte_pos, last_byte_pos + 1):
-
-            # We don't want the resource to change across requests, so we need
-            # to use a predictable data generation function
+        for i in range(first_byte_pos, last_byte_pos + 1):
+            # Predictable, request-stable data generation.
             chunks.append(ord("a") + (i % 26))
             if len(chunks) == chunk_size:
-                yield (bytes(chunks))
-                time.sleep(pause_per_byte * chunk_size)
+                yield bytes(chunks)
+                if pause_per_byte:
+                    await asyncio.sleep(pause_per_byte * chunk_size)
                 chunks = bytearray()
-
         if chunks:
-            time.sleep(pause_per_byte * len(chunks))
-            yield (bytes(chunks))
-
-    content_range = "bytes %d-%d/%d" % (first_byte_pos, last_byte_pos, numbytes)
-    response_headers = {
-        "Content-Type": "application/octet-stream",
-        "ETag": "range%d" % numbytes,
-        "Accept-Ranges": "bytes",
-        "Content-Length": str(range_length),
-        "Content-Range": content_range,
-    }
-
-    response = Response(generate_bytes(), headers=response_headers)
-
-    if (first_byte_pos == 0) and (last_byte_pos == (numbytes - 1)):
-        response.status_code = 200
-    else:
-        response.status_code = 206
-
-    return response
+            if pause_per_byte:
+                await asyncio.sleep(pause_per_byte * len(chunks))
+            yield bytes(chunks)
 
 
-@app.route("/links/<int:n>/<int:offset>")
-def link_page(n, offset):
-    """Generate a page containing n links to other pages which do the same.
-    ---
-    tags:
-      - Dynamic data
-    parameters:
-      - in: path
-        name: n
-        type: int
-      - in: path
-        name: offset
-        type: int
-    produces:
-      - text/html
-    responses:
-      200:
-        description: HTML links.
-    """
-    n = min(max(1, n), 200)  # limit to between 1 and 200 links
+@route("/links/{n:int}/{offset:int}", methods=["GET"])
+def link_page(req, resp, *, n, offset):
+    """Generate a page containing n links to other pages which do the same."""
+    n = min(max(1, n), 200)  # 1..200 links
 
     link = "<a href='{0}'>{1}</a> "
-
     html = ["<html><head><title>Links</title></head><body>"]
-    for i in xrange(n):
+    for i in range(n):
         if i == offset:
             html.append("{0} ".format(i))
         else:
             html.append(link.format(url_for("link_page", n=n, offset=i), i))
     html.append("</body></html>")
+    resp.html = "".join(html)
 
-    return "".join(html)
 
-
-@app.route("/links/<int:n>")
-def links(n):
+@route("/links/{n:int}", methods=["GET"])
+def links(req, resp, *, n):
     """Redirect to first links page."""
-    return redirect(url_for("link_page", n=n, offset=0))
+    resp.status_code = 302
+    resp.headers["Location"] = url_for("link_page", n=n, offset=0)
 
 
-@app.route("/image")
-def image():
-    """Returns a simple image of the type suggest by the Accept header.
-    ---
-    tags:
-      - Images
-    produces:
-      - image/webp
-      - image/svg+xml
-      - image/jpeg
-      - image/png
-      - image/*
-    responses:
-      200:
-        description: An image.
-    """
-
-    headers = get_headers()
+@route("/image", methods=["GET"])
+def image(req, resp):
+    """Returns a simple image of the type suggested by the Accept header."""
+    headers = get_headers(req)
     if "accept" not in headers:
-        return image_png()  # Default media type to png
+        _serve_image(resp, "images/pig_icon.png", "image/png")
+        return
 
     accept = headers["accept"].lower()
-
     if "image/webp" in accept:
-        return image_webp()
+        _serve_image(resp, "images/wolf_1.webp", "image/webp")
     elif "image/svg+xml" in accept:
-        return image_svg()
+        _serve_image(resp, "images/svg_logo.svg", "image/svg+xml")
     elif "image/jpeg" in accept:
-        return image_jpeg()
+        _serve_image(resp, "images/jackal.jpg", "image/jpeg")
     elif "image/png" in accept or "image/*" in accept:
-        return image_png()
+        _serve_image(resp, "images/pig_icon.png", "image/png")
     else:
-        return status_code(406)  # Unsupported media type
+        set_status(resp, 406)
 
 
-@app.route("/image/png")
-def image_png():
-    """Returns a simple PNG image.
-    ---
-    tags:
-      - Images
-    produces:
-      - image/png
-    responses:
-      200:
-        description: A PNG image.
-    """
-    data = resource("images/pig_icon.png")
-    return Response(data, headers={"Content-Type": "image/png"})
+def _serve_image(resp, filename, content_type):
+    resp.content = resource(filename)
+    resp.mimetype = content_type
 
 
-@app.route("/image/jpeg")
-def image_jpeg():
-    """Returns a simple JPEG image.
-    ---
-    tags:
-      - Images
-    produces:
-      - image/jpeg
-    responses:
-      200:
-        description: A JPEG image.
-    """
-    data = resource("images/jackal.jpg")
-    return Response(data, headers={"Content-Type": "image/jpeg"})
+@route("/image/png", methods=["GET"])
+def image_png(req, resp):
+    """Returns a simple PNG image."""
+    _serve_image(resp, "images/pig_icon.png", "image/png")
 
 
-@app.route("/image/webp")
-def image_webp():
-    """Returns a simple WEBP image.
-    ---
-    tags:
-      - Images
-    produces:
-      - image/webp
-    responses:
-      200:
-        description: A WEBP image.
-    """
-    data = resource("images/wolf_1.webp")
-    return Response(data, headers={"Content-Type": "image/webp"})
+@route("/image/jpeg", methods=["GET"])
+def image_jpeg(req, resp):
+    """Returns a simple JPEG image."""
+    _serve_image(resp, "images/jackal.jpg", "image/jpeg")
 
 
-@app.route("/image/svg")
-def image_svg():
-    """Returns a simple SVG image.
-    ---
-    tags:
-      - Images
-    produces:
-      - image/svg+xml
-    responses:
-      200:
-        description: An SVG image.
-    """
-    data = resource("images/svg_logo.svg")
-    return Response(data, headers={"Content-Type": "image/svg+xml"})
+@route("/image/webp", methods=["GET"])
+def image_webp(req, resp):
+    """Returns a simple WEBP image."""
+    _serve_image(resp, "images/wolf_1.webp", "image/webp")
 
 
-def resource(filename):
-    path = os.path.join(tmpl_dir, filename)
-    with open(path, "rb") as f:
-      return f.read()
+@route("/image/svg", methods=["GET"])
+def image_svg(req, resp):
+    """Returns a simple SVG image."""
+    _serve_image(resp, "images/svg_logo.svg", "image/svg+xml")
 
 
-@app.route("/xml")
-def xml():
-    """Returns a simple XML document.
-    ---
-    tags:
-      - Response formats
-    produces:
-      - application/xml
-    responses:
-      200:
-        description: An XML document.
-    """
-    response = make_response(render_template("sample.xml"))
-    response.headers["Content-Type"] = "application/xml"
-    return response
+@route("/xml", methods=["GET"])
+def xml(req, resp):
+    """Returns a simple XML document."""
+    resp.content = resource("sample.xml")
+    resp.mimetype = "application/xml"
 
 
-@app.route("/json")
-def a_json_endpoint():
-    """Returns a simple JSON document.
-    ---
-    tags:
-      - Response formats
-    produces:
-      - application/json
-    responses:
-      200:
-        description: An JSON document.
-    """
-    return flask_jsonify(
+@route("/json", methods=["GET"])
+def a_json_endpoint(req, resp):
+    """Returns a simple JSON document."""
+    jsonify(
+        resp,
         slideshow={
             "title": "Sample Slide Show",
             "date": "date of publication",
@@ -1774,13 +1045,15 @@ def a_json_endpoint():
                     ],
                 },
             ],
-        }
+        },
     )
 
 
+# Backwards-compatible alias for the ASGI app object.
+app = api
+
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--port", type=int, default=5000)
-    parser.add_argument("--host", default="127.0.0.1")
-    args = parser.parse_args()
-    app.run(port=args.port, host=args.host)
+    # Dev server (responder's built-in, uvicorn-based). Production uses granian
+    # via the Dockerfile / Procfile. Honors the PORT env var if set.
+    api.run(port=5000)
