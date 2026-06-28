@@ -23,9 +23,11 @@ import uuid
 from urllib.parse import urlencode
 
 import responder
+from responder.params import Query
 from starlette.datastructures import MutableHeaders
 
 from . import filters
+from . import models
 from .helpers import (
     ANGRY_ASCII,
     ROBOT_TXT,
@@ -175,20 +177,36 @@ api.add_middleware(HttpbinMiddleware)
 _ROUTE_PATTERNS = {}
 
 
-def route(pattern, methods=None, name=None, extra_patterns=(), include_in_schema=True):
+def route(
+    pattern,
+    methods=None,
+    name=None,
+    extra_patterns=(),
+    include_in_schema=True,
+    response_model=None,
+    request_model=None,
+    params_model=None,
+):
     """Register a responder route and remember its pattern for ``url_for``.
 
-    ``include_in_schema=False`` keeps the route working but hides it from the
-    OpenAPI schema / Swagger UI, matching httpbin.org (which documents 51
+    Delegates to ``api.route`` so responder's pydantic schema features
+    (``response_model`` / ``request_model`` / ``params_model``) and OpenAPI
+    registration apply. ``include_in_schema=False`` keeps the route working but
+    hides it from the schema/Swagger UI, matching httpbin.org (which documents 52
     endpoints but still serves a few undocumented helper routes).
     """
 
     def decorator(handler):
         endpoint = name or handler.__name__
         _ROUTE_PATTERNS.setdefault(endpoint, pattern)
-        if not include_in_schema:
-            handler._include_in_schema = False
-        api.add_route(pattern, handler, methods=methods)
+        handler = api.route(
+            pattern,
+            methods=methods,
+            include_in_schema=include_in_schema,
+            response_model=response_model,
+            request_model=request_model,
+            params_model=params_model,
+        )(handler)
         for extra in extra_patterns:
             api.add_route(extra, handler, methods=methods)
         return handler
@@ -272,13 +290,23 @@ def view_landing_page(req, resp):
 
 @route("/html", methods=["GET"])
 def view_html_page(req, resp):
-    """Returns a simple HTML document."""
+    """Returns a simple HTML document.
+    ---
+    get:
+        tags: [Response formats]
+        summary: Returns a simple HTML document.
+    """
     resp.html = text_resource("moby.html")
 
 
 @route("/robots.txt", methods=["GET"])
 def view_robots_page(req, resp):
-    """Returns some robots.txt rules."""
+    """Returns some robots.txt rules.
+    ---
+    get:
+        tags: [Response formats]
+        summary: Returns some robots.txt rules.
+    """
     resp.content = ROBOT_TXT.encode("utf-8")
     resp.mimetype = "text/plain"
     resp.encoding = None  # suppress responder's non-standard `Encoding:` header
@@ -286,15 +314,25 @@ def view_robots_page(req, resp):
 
 @route("/deny", methods=["GET"])
 def view_deny_page(req, resp):
-    """Returns page denied by robots.txt rules."""
+    """Returns page denied by robots.txt rules.
+    ---
+    get:
+        tags: [Response formats]
+        summary: Returns a page denied by the robots.txt rules.
+    """
     resp.content = ANGRY_ASCII.encode("utf-8")
     resp.mimetype = "text/plain"
     resp.encoding = None
 
 
-@route("/ip", methods=["GET"])
+@route("/ip", methods=["GET"], response_model=models.IPResponse)
 def view_origin(req, resp):
-    """Returns the requester's IP Address."""
+    """Returns the requester's IP Address.
+    ---
+    get:
+        tags: [Request inspection]
+        summary: Returns the requester's IP address.
+    """
     jsonify(resp, origin=req.headers.get("X-Forwarded-For", _remote_addr(req)))
 
 
@@ -302,28 +340,48 @@ def _remote_addr(req):
     return req.client.host if req.client else None
 
 
-@route("/uuid", methods=["GET"])
+@route("/uuid", methods=["GET"], response_model=models.UUIDResponse)
 def view_uuid(req, resp):
-    """Return a UUID4."""
+    """Return a UUID4.
+    ---
+    get:
+        tags: [Dynamic data]
+        summary: Returns a UUID4.
+    """
     jsonify(resp, uuid=str(uuid.uuid4()))
 
 
-@route("/headers", methods=["GET"])
+@route("/headers", methods=["GET"], response_model=models.HeadersResponse)
 def view_headers(req, resp):
-    """Return the incoming request's HTTP headers."""
+    """Return the incoming request's HTTP headers.
+    ---
+    get:
+        tags: [Request inspection]
+        summary: Returns the request's HTTP headers.
+    """
     jsonify(resp, headers=get_headers(req))
 
 
-@route("/user-agent", methods=["GET"])
+@route("/user-agent", methods=["GET"], response_model=models.UserAgentResponse)
 def view_user_agent(req, resp):
-    """Return the incoming request's User-Agent header."""
+    """Return the incoming request's User-Agent header.
+    ---
+    get:
+        tags: [Request inspection]
+        summary: Returns the request's User-Agent header.
+    """
     headers = get_headers(req)
     jsonify(resp, {"user-agent": headers.get("User-Agent")})
 
 
-@route("/get", methods=["GET"])
+@route("/get", methods=["GET"], response_model=models.GetResponse)
 async def view_get(req, resp):
-    """The request's query parameters."""
+    """The request's query parameters.
+    ---
+    get:
+        tags: [HTTP Methods]
+        summary: The request's query parameters.
+    """
     jsonify(resp, await get_dict(req, "url", "args", "headers", "origin"))
 
 
@@ -331,9 +389,18 @@ async def view_get(req, resp):
     "/anything",
     methods=["GET", "POST", "PUT", "DELETE", "PATCH", "TRACE"],
     extra_patterns=("/anything/{anything:path}",),
+    response_model=models.AnythingResponse,
 )
 async def view_anything(req, resp, *, anything=None):
-    """Returns anything passed in request data."""
+    """Returns anything passed in request data.
+    ---
+    get: {tags: [Anything], summary: Returns anything passed in request data.}
+    post: {tags: [Anything]}
+    put: {tags: [Anything]}
+    delete: {tags: [Anything]}
+    patch: {tags: [Anything]}
+    trace: {tags: [Anything]}
+    """
     jsonify(
         resp,
         await get_dict(
@@ -351,9 +418,14 @@ async def view_anything(req, resp, *, anything=None):
     )
 
 
-@route("/post", methods=["POST"])
+@route("/post", methods=["POST"], response_model=models.MethodResponse)
 async def view_post(req, resp):
-    """The request's POST parameters."""
+    """The request's POST parameters.
+    ---
+    post:
+        tags: [HTTP Methods]
+        summary: The request's POST parameters.
+    """
     jsonify(
         resp,
         await get_dict(
@@ -362,9 +434,14 @@ async def view_post(req, resp):
     )
 
 
-@route("/put", methods=["PUT"])
+@route("/put", methods=["PUT"], response_model=models.MethodResponse)
 async def view_put(req, resp):
-    """The request's PUT parameters."""
+    """The request's PUT parameters.
+    ---
+    put:
+        tags: [HTTP Methods]
+        summary: The request's PUT parameters.
+    """
     jsonify(
         resp,
         await get_dict(
@@ -373,9 +450,14 @@ async def view_put(req, resp):
     )
 
 
-@route("/patch", methods=["PATCH"])
+@route("/patch", methods=["PATCH"], response_model=models.MethodResponse)
 async def view_patch(req, resp):
-    """The request's PATCH parameters."""
+    """The request's PATCH parameters.
+    ---
+    patch:
+        tags: [HTTP Methods]
+        summary: The request's PATCH parameters.
+    """
     jsonify(
         resp,
         await get_dict(
@@ -384,9 +466,14 @@ async def view_patch(req, resp):
     )
 
 
-@route("/delete", methods=["DELETE"])
+@route("/delete", methods=["DELETE"], response_model=models.MethodResponse)
 async def view_delete(req, resp):
-    """The request's DELETE parameters."""
+    """The request's DELETE parameters.
+    ---
+    delete:
+        tags: [HTTP Methods]
+        summary: The request's DELETE parameters.
+    """
     jsonify(
         resp,
         await get_dict(
@@ -395,9 +482,14 @@ async def view_delete(req, resp):
     )
 
 
-@route("/gzip", methods=["GET"])
+@route("/gzip", methods=["GET"], response_model=models.EncodedResponse)
 async def view_gzip_encoded_content(req, resp):
-    """Returns GZip-encoded data."""
+    """Returns GZip-encoded data.
+    ---
+    get:
+        tags: [Response formats]
+        summary: Returns GZip-encoded data.
+    """
     data = await get_dict(req, "origin", "headers", method=str(req.method), gzipped=True)
     payload = dumps(data).encode("utf-8")
     resp.content = filters.gzip_compress(payload)
@@ -406,9 +498,14 @@ async def view_gzip_encoded_content(req, resp):
     resp.headers["Content-Length"] = str(len(resp.content))
 
 
-@route("/deflate", methods=["GET"])
+@route("/deflate", methods=["GET"], response_model=models.EncodedResponse)
 async def view_deflate_encoded_content(req, resp):
-    """Returns Deflate-encoded data."""
+    """Returns Deflate-encoded data.
+    ---
+    get:
+        tags: [Response formats]
+        summary: Returns Deflate-encoded data.
+    """
     data = await get_dict(req, "origin", "headers", method=str(req.method), deflated=True)
     payload = dumps(data).encode("utf-8")
     resp.content = filters.deflate_compress(payload)
@@ -417,9 +514,14 @@ async def view_deflate_encoded_content(req, resp):
     resp.headers["Content-Length"] = str(len(resp.content))
 
 
-@route("/brotli", methods=["GET"])
+@route("/brotli", methods=["GET"], response_model=models.EncodedResponse)
 async def view_brotli_encoded_content(req, resp):
-    """Returns Brotli-encoded data."""
+    """Returns Brotli-encoded data.
+    ---
+    get:
+        tags: [Response formats]
+        summary: Returns Brotli-encoded data.
+    """
     data = await get_dict(req, "origin", "headers", method=str(req.method), brotli=True)
     payload = dumps(data).encode("utf-8")
     compressed = filters.brotli_compress(payload)
@@ -436,7 +538,12 @@ async def view_brotli_encoded_content(req, resp):
 
 @route("/redirect/{n:int}", methods=["GET"])
 def redirect_n_times(req, resp, *, n):
-    """302 Redirects n times."""
+    """302 Redirects n times.
+    ---
+    get:
+        tags: [Redirects]
+        summary: 302 redirects n times.
+    """
     assert n > 0
 
     absolute = req.params.get("absolute", "false").lower() == "true"
@@ -456,7 +563,15 @@ def redirect_n_times(req, resp, *, n):
 
 @route("/redirect-to", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "TRACE"])
 def redirect_to(req, resp):
-    """302/3XX Redirects to the given URL."""
+    """302/3XX Redirects to the given URL.
+    ---
+    get: {tags: [Redirects], summary: 302/3XX redirects to the given URL.}
+    post: {tags: [Redirects]}
+    put: {tags: [Redirects]}
+    delete: {tags: [Redirects]}
+    patch: {tags: [Redirects]}
+    trace: {tags: [Redirects]}
+    """
     # The original wrapped args in a case-insensitive dict.
     args = {key.lower(): value for key, value in query_pairs(req)}
 
@@ -474,7 +589,12 @@ def redirect_to(req, resp):
 
 @route("/relative-redirect/{n:int}", methods=["GET"])
 def relative_redirect_n_times(req, resp, *, n):
-    """Relatively 302 Redirects n times."""
+    """Relatively 302 Redirects n times.
+    ---
+    get:
+        tags: [Redirects]
+        summary: Relative 302 redirects n times.
+    """
     assert n > 0
     resp.status_code = 302
     if n == 1:
@@ -485,7 +605,12 @@ def relative_redirect_n_times(req, resp, *, n):
 
 @route("/absolute-redirect/{n:int}", methods=["GET"])
 def absolute_redirect_n_times(req, resp, *, n):
-    """Absolutely 302 Redirects n times."""
+    """Absolutely 302 Redirects n times.
+    ---
+    get:
+        tags: [Redirects]
+        summary: Absolute 302 redirects n times.
+    """
     assert n > 0
     resp.status_code = 302
     if n == 1:
@@ -496,9 +621,14 @@ def absolute_redirect_n_times(req, resp, *, n):
     )
 
 
-@route("/stream/{n:int}", methods=["GET"])
+@route("/stream/{n:int}", methods=["GET"], response_model=models.StreamResponse)
 async def stream_n_messages(req, resp, *, n):
-    """Stream n JSON responses."""
+    """Stream n JSON responses.
+    ---
+    get:
+        tags: [Dynamic data]
+        summary: Streams n JSON responses (newline-delimited).
+    """
     data = await get_dict(req, "url", "args", "headers", "origin")
     n = min(n, 100)
     resp.mimetype = "application/json"
@@ -513,7 +643,15 @@ async def stream_n_messages(req, resp, *, n):
 
 @route("/status/{codes}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "TRACE"])
 def view_status_code(req, resp, *, codes):
-    """Return status code or random status code if more than one are given."""
+    """Return status code or random status code if more than one are given.
+    ---
+    get: {tags: [Status codes], summary: Returns the given (or weighted-random) status code.}
+    post: {tags: [Status codes]}
+    put: {tags: [Status codes]}
+    delete: {tags: [Status codes]}
+    patch: {tags: [Status codes]}
+    trace: {tags: [Status codes]}
+    """
     if "," not in codes:
         try:
             code = int(codes)
@@ -545,7 +683,11 @@ def view_status_code(req, resp, *, codes):
 
 @route("/response-headers", methods=["GET", "POST"])
 def response_headers(req, resp):
-    """Returns a set of response headers from the query string."""
+    """Returns a set of response headers from the query string.
+    ---
+    get: {tags: [Response inspection], summary: Returns response headers from the query string.}
+    post: {tags: [Response inspection]}
+    """
     multi = query_multi(req)
 
     # responder's response headers are a plain dict (no repeated keys), so we
@@ -580,9 +722,14 @@ def _set_cookie(resp, key, value="", **extra):
     resp.set_cookie(key, value=value, httponly=False, samesite=None, **extra)
 
 
-@route("/cookies", methods=["GET"])
+@route("/cookies", methods=["GET"], response_model=models.CookiesResponse)
 def view_cookies(req, resp, hide_env=True):
-    """Returns cookie data."""
+    """Returns cookie data.
+    ---
+    get:
+        tags: [Cookies]
+        summary: Returns the cookies sent in the request.
+    """
     cookies = dict(req.cookies.items())
     if hide_env and not query_has(req, "show_env"):
         for key in ENV_COOKIES:
@@ -598,7 +745,12 @@ def view_forms_post(req, resp):
 
 @route("/cookies/set/{name}/{value}", methods=["GET"])
 def set_cookie(req, resp, *, name, value):
-    """Sets a cookie and redirects to the cookie list."""
+    """Sets a cookie and redirects to the cookie list.
+    ---
+    get:
+        tags: [Cookies]
+        summary: Sets a cookie and redirects to the cookie list.
+    """
     resp.status_code = 302
     resp.headers["Location"] = url_for("view_cookies")
     _set_cookie(resp, name, value=value, secure=secure_cookie(req))
@@ -606,7 +758,12 @@ def set_cookie(req, resp, *, name, value):
 
 @route("/cookies/set", methods=["GET"])
 def set_cookies(req, resp):
-    """Sets cookie(s) as provided by the query string and redirects to cookie list."""
+    """Sets cookie(s) as provided by the query string and redirects to cookie list.
+    ---
+    get:
+        tags: [Cookies]
+        summary: Sets cookies from the query string and redirects to the cookie list.
+    """
     resp.status_code = 302
     resp.headers["Location"] = url_for("view_cookies")
     for key, value in query_pairs(req):
@@ -615,7 +772,12 @@ def set_cookies(req, resp):
 
 @route("/cookies/delete", methods=["GET"])
 def delete_cookies(req, resp):
-    """Deletes cookie(s) as provided by the query string and redirects to cookie list."""
+    """Deletes cookie(s) as provided by the query string and redirects to cookie list.
+    ---
+    get:
+        tags: [Cookies]
+        summary: Deletes cookies named in the query string and redirects to the cookie list.
+    """
     resp.status_code = 302
     resp.headers["Location"] = url_for("view_cookies")
     for key, _value in query_pairs(req):
@@ -624,27 +786,42 @@ def delete_cookies(req, resp):
         )
 
 
-@route("/basic-auth/{user}/{passwd}", methods=["GET"])
+@route("/basic-auth/{user}/{passwd}", methods=["GET"], response_model=models.AuthResponse)
 def basic_auth(req, resp, *, user, passwd):
-    """Prompts the user for authorization using HTTP Basic Auth."""
+    """Prompts the user for authorization using HTTP Basic Auth.
+    ---
+    get:
+        tags: [Auth]
+        summary: Challenges HTTP Basic Auth.
+    """
     if not check_basic_auth(req, user, passwd):
         set_status(resp, 401)
         return
     jsonify(resp, authenticated=True, user=user)
 
 
-@route("/hidden-basic-auth/{user}/{passwd}", methods=["GET"])
+@route("/hidden-basic-auth/{user}/{passwd}", methods=["GET"], response_model=models.AuthResponse)
 def hidden_basic_auth(req, resp, *, user, passwd):
-    """Prompts the user for authorization using HTTP Basic Auth, 404 on failure."""
+    """Prompts the user for authorization using HTTP Basic Auth, 404 on failure.
+    ---
+    get:
+        tags: [Auth]
+        summary: 404'd HTTP Basic Auth.
+    """
     if not check_basic_auth(req, user, passwd):
         set_status(resp, 404)
         return
     jsonify(resp, authenticated=True, user=user)
 
 
-@route("/bearer", methods=["GET"])
+@route("/bearer", methods=["GET"], response_model=models.BearerResponse)
 def bearer_auth(req, resp):
-    """Prompts the user for authorization using bearer authentication."""
+    """Prompts the user for authorization using bearer authentication.
+    ---
+    get:
+        tags: [Auth]
+        summary: Challenges Bearer Auth.
+    """
     authorization = req.headers.get("Authorization")
     if not (authorization and authorization.startswith("Bearer ")):
         resp.status_code = 401
@@ -655,21 +832,36 @@ def bearer_auth(req, resp):
     jsonify(resp, authenticated=True, token=token)
 
 
-@route("/digest-auth/{qop}/{user}/{passwd}", methods=["GET"])
+@route("/digest-auth/{qop}/{user}/{passwd}", methods=["GET"], response_model=models.AuthResponse)
 async def digest_auth_md5(req, resp, *, qop, user, passwd):
-    """Prompts the user for authorization using Digest Auth."""
+    """Prompts the user for authorization using Digest Auth.
+    ---
+    get:
+        tags: [Auth]
+        summary: Challenges HTTP Digest Auth.
+    """
     await _digest_auth(req, resp, qop, user, passwd, "MD5", "never")
 
 
-@route("/digest-auth/{qop}/{user}/{passwd}/{algorithm}", methods=["GET"])
+@route("/digest-auth/{qop}/{user}/{passwd}/{algorithm}", methods=["GET"], response_model=models.AuthResponse)
 async def digest_auth_nostale(req, resp, *, qop, user, passwd, algorithm):
-    """Prompts the user for authorization using Digest Auth + Algorithm."""
+    """Prompts the user for authorization using Digest Auth + Algorithm.
+    ---
+    get:
+        tags: [Auth]
+        summary: Challenges HTTP Digest Auth with a chosen algorithm.
+    """
     await _digest_auth(req, resp, qop, user, passwd, algorithm, "never")
 
 
-@route("/digest-auth/{qop}/{user}/{passwd}/{algorithm}/{stale_after}", methods=["GET"])
+@route("/digest-auth/{qop}/{user}/{passwd}/{algorithm}/{stale_after}", methods=["GET"], response_model=models.AuthResponse)
 async def digest_auth(req, resp, *, qop, user, passwd, algorithm, stale_after):
-    """Prompts the user for authorization using Digest Auth + Algorithm, with stale_after."""
+    """Prompts the user for authorization using Digest Auth + Algorithm, with stale_after.
+    ---
+    get:
+        tags: [Auth]
+        summary: Challenges HTTP Digest Auth, with a stale_after window.
+    """
     await _digest_auth(req, resp, qop, user, passwd, algorithm, stale_after)
 
 
@@ -746,9 +938,21 @@ def _digest_challenge(req, resp, qop, algorithm, stale=False):
     )
 
 
-@route("/delay/{delay}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "TRACE"])
+@route(
+    "/delay/{delay}",
+    methods=["GET", "POST", "PUT", "DELETE", "PATCH", "TRACE"],
+    response_model=models.MethodResponse,
+)
 async def delay_response(req, resp, *, delay):
-    """Returns a delayed response (max of 10 seconds)."""
+    """Returns a delayed response (max of 10 seconds).
+    ---
+    get: {tags: [Dynamic data], summary: Returns a delayed response (max 10s).}
+    post: {tags: [Dynamic data]}
+    put: {tags: [Dynamic data]}
+    delete: {tags: [Dynamic data]}
+    patch: {tags: [Dynamic data]}
+    trace: {tags: [Dynamic data]}
+    """
     delay = min(float(delay), 10)
     await asyncio.sleep(delay)
     jsonify(
@@ -758,11 +962,22 @@ async def delay_response(req, resp, *, delay):
 
 
 @route("/drip", methods=["GET"])
-async def drip(req, resp):
-    """Drips data over a duration after an optional initial delay."""
-    duration = float(req.params.get("duration", 2))
-    numbytes = min(int(req.params.get("numbytes", 10)), 10 * 1024 * 1024)
-    code = int(req.params.get("code", 200))
+async def drip(
+    req,
+    resp,
+    *,
+    numbytes: int = Query(10, description="Number of bytes to stream."),
+    duration: float = Query(2, description="Seconds over which to drip the bytes."),
+    delay: float = Query(0, description="Initial delay in seconds before streaming."),
+    code: int = Query(200, description="HTTP status code to return."),
+):
+    """Drips data over a duration after an optional initial delay.
+    ---
+    get:
+        tags: [Dynamic data]
+        summary: Drips data over a duration after an optional initial delay.
+    """
+    numbytes = min(numbytes, 10 * 1024 * 1024)
 
     if numbytes <= 0:
         resp.status_code = 400
@@ -770,7 +985,6 @@ async def drip(req, resp):
         resp.mimetype = "text/html; charset=utf-8"
         return
 
-    delay = float(req.params.get("delay", 0))
     if delay > 0:
         await asyncio.sleep(delay)
 
@@ -789,7 +1003,12 @@ async def drip(req, resp):
 
 @route("/base64/{value}", methods=["GET"])
 def decode_base64(req, resp, *, value):
-    """Decodes base64url-encoded string."""
+    """Decodes base64url-encoded string.
+    ---
+    get:
+        tags: [Dynamic data]
+        summary: Decodes a base64url-encoded string.
+    """
     encoded = value.encode("utf-8")
     try:
         decoded = base64.urlsafe_b64decode(encoded).decode("utf-8")
@@ -800,9 +1019,14 @@ def decode_base64(req, resp, *, value):
     resp.headers["Content-Type"] = "text/html; charset=utf-8"
 
 
-@route("/cache", methods=["GET"])
+@route("/cache", methods=["GET"], response_model=models.GetResponse)
 async def cache(req, resp):
-    """Returns a 304 if If-Modified-Since or If-None-Match is present; otherwise a normal GET."""
+    """Returns a 304 if If-Modified-Since or If-None-Match is present; otherwise a normal GET.
+    ---
+    get:
+        tags: [Response inspection]
+        summary: Returns 200 (with caching headers) unless a conditional header yields 304.
+    """
     is_conditional = req.headers.get("If-Modified-Since") or req.headers.get(
         "If-None-Match"
     )
@@ -814,9 +1038,14 @@ async def cache(req, resp):
         set_status(resp, 304)
 
 
-@route("/etag/{etag}", methods=["GET"])
+@route("/etag/{etag}", methods=["GET"], response_model=models.GetResponse)
 async def etag(req, resp, *, etag):
-    """Responds to If-None-Match / If-Match conditional headers for the given etag."""
+    """Responds to If-None-Match / If-Match conditional headers for the given etag.
+    ---
+    get:
+        tags: [Response inspection]
+        summary: Handles If-None-Match / If-Match for the given etag.
+    """
     if_none_match = parse_multi_value_header(req.headers.get("If-None-Match"))
     if_match = parse_multi_value_header(req.headers.get("If-Match"))
 
@@ -834,44 +1063,68 @@ async def etag(req, resp, *, etag):
     resp.headers["ETag"] = etag
 
 
-@route("/cache/{value:int}", methods=["GET"])
+@route("/cache/{value:int}", methods=["GET"], response_model=models.GetResponse)
 async def cache_control(req, resp, *, value):
-    """Sets a Cache-Control header for n seconds."""
+    """Sets a Cache-Control header for n seconds.
+    ---
+    get:
+        tags: [Response inspection]
+        summary: Sets a Cache-Control header for n seconds.
+    """
     jsonify(resp, await get_dict(req, "url", "args", "headers", "origin"))
     resp.headers["Cache-Control"] = "public, max-age={0}".format(value)
 
 
 @route("/encoding/utf8", methods=["GET"])
 def encoding(req, resp):
-    """Returns a UTF-8 encoded body."""
+    """Returns a UTF-8 encoded body.
+    ---
+    get:
+        tags: [Response formats]
+        summary: Returns a UTF-8 encoded body.
+    """
     resp.content = resource("UTF-8-demo.txt")
     resp.mimetype = "text/html; charset=utf-8"
 
 
 @route("/bytes/{n:int}", methods=["GET"])
-def random_bytes(req, resp, *, n):
-    """Returns n random bytes generated with given seed."""
+def random_bytes(req, resp, *, n, seed: int = Query(None, description="RNG seed.")):
+    """Returns n random bytes generated with given seed.
+    ---
+    get:
+        tags: [Dynamic data]
+        summary: Returns n random bytes (optionally seeded).
+    """
     n = min(n, 100 * 1024)  # 100KB limit
 
-    if "seed" in req.params:
-        random.seed(int(req.params["seed"]))
+    if seed is not None:
+        random.seed(seed)
 
     resp.content = bytes(bytearray(random.randint(0, 255) for _ in range(n)))
     resp.mimetype = "application/octet-stream"
 
 
 @route("/stream-bytes/{n:int}", methods=["GET"])
-async def stream_random_bytes(req, resp, *, n):
-    """Streams n random bytes generated with given seed, at given chunk size per packet."""
+async def stream_random_bytes(
+    req,
+    resp,
+    *,
+    n,
+    seed: int = Query(None, description="RNG seed."),
+    chunk_size: int = Query(None, description="Bytes per streamed chunk."),
+):
+    """Streams n random bytes generated with given seed, at given chunk size per packet.
+    ---
+    get:
+        tags: [Dynamic data]
+        summary: Streams n random bytes (optionally seeded) in chunks.
+    """
     n = min(n, 100 * 1024)  # 100KB limit
 
-    if "seed" in req.params:
-        random.seed(int(req.params["seed"]))
+    if seed is not None:
+        random.seed(seed)
 
-    if "chunk_size" in req.params:
-        chunk_size = max(1, int(req.params["chunk_size"]))
-    else:
-        chunk_size = 10 * 1024
+    chunk_size = max(1, chunk_size) if chunk_size is not None else 10 * 1024
 
     resp.mimetype = "application/octet-stream"
 
@@ -888,8 +1141,20 @@ async def stream_random_bytes(req, resp, *, n):
 
 
 @route("/range/{numbytes:int}", methods=["GET"])
-async def range_request(req, resp, *, numbytes):
-    """Streams numbytes bytes, honoring a Range header to select a subset."""
+async def range_request(
+    req,
+    resp,
+    *,
+    numbytes,
+    duration: float = Query(0, description="Seconds over which to drip the range."),
+    chunk_size: int = Query(None, description="Bytes per streamed chunk."),
+):
+    """Streams numbytes bytes, honoring a Range header to select a subset.
+    ---
+    get:
+        tags: [Dynamic data]
+        summary: Streams numbytes bytes, honoring a Range header.
+    """
     if numbytes <= 0 or numbytes > (100 * 1024):
         resp.status_code = 404
         resp.content = b"number of bytes must be in the range (0, 102400]"
@@ -897,13 +1162,7 @@ async def range_request(req, resp, *, numbytes):
         resp.headers["Accept-Ranges"] = "bytes"
         return
 
-    params = req.params
-    if "chunk_size" in params:
-        chunk_size = max(1, int(params["chunk_size"]))
-    else:
-        chunk_size = 10 * 1024
-
-    duration = float(params.get("duration", 0))
+    chunk_size = max(1, chunk_size) if chunk_size is not None else 10 * 1024
     pause_per_byte = duration / numbytes
 
     first_byte_pos, last_byte_pos = get_request_range(req.headers, numbytes)
@@ -954,7 +1213,12 @@ async def range_request(req, resp, *, numbytes):
 
 @route("/links/{n:int}/{offset:int}", methods=["GET"])
 def link_page(req, resp, *, n, offset):
-    """Generate a page containing n links to other pages which do the same."""
+    """Generate a page containing n links to other pages which do the same.
+    ---
+    get:
+        tags: [Dynamic data]
+        summary: Returns a page of n HTML links.
+    """
     n = min(max(1, n), 200)  # 1..200 links
 
     link = "<a href='{0}'>{1}</a> "
@@ -977,7 +1241,12 @@ def links(req, resp, *, n):
 
 @route("/image", methods=["GET"])
 def image(req, resp):
-    """Returns a simple image of the type suggested by the Accept header."""
+    """Returns a simple image of the type suggested by the Accept header.
+    ---
+    get:
+        tags: [Images]
+        summary: Returns an image matching the Accept header.
+    """
     headers = get_headers(req)
     if "accept" not in headers:
         _serve_image(resp, "images/pig_icon.png", "image/png")
@@ -1003,38 +1272,68 @@ def _serve_image(resp, filename, content_type):
 
 @route("/image/png", methods=["GET"])
 def image_png(req, resp):
-    """Returns a simple PNG image."""
+    """Returns a simple PNG image.
+    ---
+    get:
+        tags: [Images]
+        summary: Returns a simple PNG image.
+    """
     _serve_image(resp, "images/pig_icon.png", "image/png")
 
 
 @route("/image/jpeg", methods=["GET"])
 def image_jpeg(req, resp):
-    """Returns a simple JPEG image."""
+    """Returns a simple JPEG image.
+    ---
+    get:
+        tags: [Images]
+        summary: Returns a simple JPEG image.
+    """
     _serve_image(resp, "images/jackal.jpg", "image/jpeg")
 
 
 @route("/image/webp", methods=["GET"])
 def image_webp(req, resp):
-    """Returns a simple WEBP image."""
+    """Returns a simple WEBP image.
+    ---
+    get:
+        tags: [Images]
+        summary: Returns a simple WebP image.
+    """
     _serve_image(resp, "images/wolf_1.webp", "image/webp")
 
 
 @route("/image/svg", methods=["GET"])
 def image_svg(req, resp):
-    """Returns a simple SVG image."""
+    """Returns a simple SVG image.
+    ---
+    get:
+        tags: [Images]
+        summary: Returns a simple SVG image.
+    """
     _serve_image(resp, "images/svg_logo.svg", "image/svg+xml")
 
 
 @route("/xml", methods=["GET"])
 def xml(req, resp):
-    """Returns a simple XML document."""
+    """Returns a simple XML document.
+    ---
+    get:
+        tags: [Response formats]
+        summary: Returns a simple XML document.
+    """
     resp.content = resource("sample.xml")
     resp.mimetype = "application/xml"
 
 
-@route("/json", methods=["GET"])
+@route("/json", methods=["GET"], response_model=models.JsonResponse)
 def a_json_endpoint(req, resp):
-    """Returns a simple JSON document."""
+    """Returns a simple JSON document.
+    ---
+    get:
+        tags: [Response formats]
+        summary: Returns a simple JSON document.
+    """
     jsonify(
         resp,
         slideshow={
