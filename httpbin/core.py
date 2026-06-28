@@ -175,12 +175,19 @@ api.add_middleware(HttpbinMiddleware)
 _ROUTE_PATTERNS = {}
 
 
-def route(pattern, methods=None, name=None, extra_patterns=()):
-    """Register a responder route and remember its pattern for ``url_for``."""
+def route(pattern, methods=None, name=None, extra_patterns=(), include_in_schema=True):
+    """Register a responder route and remember its pattern for ``url_for``.
+
+    ``include_in_schema=False`` keeps the route working but hides it from the
+    OpenAPI schema / Swagger UI, matching httpbin.org (which documents 51
+    endpoints but still serves a few undocumented helper routes).
+    """
 
     def decorator(handler):
         endpoint = name or handler.__name__
         _ROUTE_PATTERNS.setdefault(endpoint, pattern)
+        if not include_in_schema:
+            handler._include_in_schema = False
         api.add_route(pattern, handler, methods=methods)
         for extra in extra_patterns:
             api.add_route(extra, handler, methods=methods)
@@ -252,7 +259,7 @@ def text_resource(filename):
 # ------
 
 
-@route("/legacy", methods=["GET"])
+@route("/legacy", methods=["GET"], include_in_schema=False)
 def view_landing_page(req, resp):
     """Generates the landing page in the classic httpbin manpage layout."""
     try:
@@ -583,7 +590,7 @@ def view_cookies(req, resp, hide_env=True):
     jsonify(resp, cookies=cookies)
 
 
-@route("/forms/post", methods=["GET"])
+@route("/forms/post", methods=["GET"], include_in_schema=False)
 def view_forms_post(req, resp):
     """Simple HTML form."""
     resp.html = text_resource("forms-post.html")
@@ -961,7 +968,7 @@ def link_page(req, resp, *, n, offset):
     resp.html = "".join(html)
 
 
-@route("/links/{n:int}", methods=["GET"])
+@route("/links/{n:int}", methods=["GET"], include_in_schema=False)
 def links(req, resp, *, n):
     """Redirect to first links page."""
     resp.status_code = 302

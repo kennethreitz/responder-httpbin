@@ -82,7 +82,7 @@ Interactive docs live at `/` (Swagger UI); the OpenAPI schema is at `/schema.yml
 | **Request inspection** | `/headers` · `/ip` · `/user-agent` |
 | **Response inspection** | `/cache` · `/cache/{n}` · `/etag/{etag}` · `/response-headers` |
 | **Response formats** | `/gzip` · `/deflate` · `/brotli` · `/html` · `/xml` · `/json` · `/robots.txt` · `/deny` · `/encoding/utf8` |
-| **Dynamic data** | `/uuid` · `/base64/{value}` · `/bytes/{n}` · `/stream-bytes/{n}` · `/stream/{n}` · `/delay/{n}` · `/drip` · `/range/{n}` · `/links/{n}` |
+| **Dynamic data** | `/uuid` · `/base64/{value}` · `/bytes/{n}` · `/stream-bytes/{n}` · `/stream/{n}` · `/delay/{delay}` · `/drip` · `/range/{numbytes}` · `/links/{n}/{offset}` |
 | **Cookies** | `/cookies` · `/cookies/set` · `/cookies/set/{name}/{value}` · `/cookies/delete` |
 | **Images** | `/image` (Accept-negotiated) · `/image/png` · `/image/jpeg` · `/image/webp` · `/image/svg` |
 | **Redirects** | `/redirect/{n}` · `/redirect-to?url=` · `/relative-redirect/{n}` · `/absolute-redirect/{n}` |
