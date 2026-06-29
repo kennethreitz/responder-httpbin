@@ -6,7 +6,7 @@ A [Kenneth Reitz](http://kennethreitz.org/) project.
 
 **responder-httpbin** is the classic [httpbin](https://github.com/postmanlabs/httpbin)
 API, re-implemented on top of the [**responder**](https://responder.kennethreitz.org/)
-web framework (v5). It's a dogfooding fork — a faithful, drop-in port of every
+web framework (v7). It's a dogfooding fork — a faithful, drop-in port of every
 httpbin endpoint — built to exercise responder end to end.
 
 > This is **not** httpbin.org. The original httpbin was sold to Postman Labs years

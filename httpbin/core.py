@@ -184,14 +184,13 @@ def route(
     extra_patterns=(),
     include_in_schema=True,
     response_model=None,
-    request_model=None,
     params_model=None,
 ):
     """Register a responder route and remember its pattern for ``url_for``.
 
     Delegates to ``api.route`` so responder's pydantic schema features
-    (``response_model`` / ``request_model`` / ``params_model``) and OpenAPI
-    registration apply. ``include_in_schema=False`` keeps the route working but
+    (``response_model`` / ``params_model``) and OpenAPI registration apply.
+    ``include_in_schema=False`` keeps the route working but
     hides it from the schema/Swagger UI, matching httpbin.org (which documents 52
     endpoints but still serves a few undocumented helper routes).
     """
@@ -204,7 +203,6 @@ def route(
             methods=methods,
             include_in_schema=include_in_schema,
             response_model=response_model,
-            request_model=request_model,
             params_model=params_model,
         )(handler)
         for extra in extra_patterns:
