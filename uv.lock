@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.11"
 
 [[package]]
@@ -777,23 +777,28 @@ wheels = [
 
 [[package]]
 name = "responder"
-version = "7.0.0"
+version = "9.4.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "a2wsgi" },
     { name = "apispec" },
     { name = "chardet" },
     { name = "docopt-ng" },
+    { name = "httpx" },
+    { name = "httpx2" },
+    { name = "itsdangerous" },
+    { name = "jinja2" },
     { name = "marshmallow" },
     { name = "msgpack" },
     { name = "pydantic" },
     { name = "python-multipart" },
-    { name = "starlette", extra = ["full"] },
+    { name = "pyyaml" },
+    { name = "starlette" },
     { name = "uvicorn", extra = ["standard"] },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/1d/69/0fc84b6cdf07cb1135976a0d4fe0f3c1aa06ba1243e815b9066c665f5f42/responder-7.0.0.tar.gz", hash = "sha256:a3028cc8d9fd2afdb87a81d9d12f3c81d5b802ed405dc64145efa700862b23e7", size = 173579, upload-time = "2026-06-29T18:52:12.134Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/30/05/d6c5cc6ef7bbed4521696861097be01d3e3182498de8b98bde6d9e101188/responder-9.4.0.tar.gz", hash = "sha256:17063e8ebfe5cb0cfb3111b257803acc175a7ce8208409da93aed2121fcc73bb", size = 400842, upload-time = "2026-11-10T01:54:59.573Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/f9/47/55f2203d6c6787d78fe4f29b082b782ec2b4afbc52375ad09475db5a11a8/responder-7.0.0-py3-none-any.whl", hash = "sha256:00e1281a4f7a7e4ef84cccaba600805b15e902d435f1f0d9f50771410a30c7b1", size = 120063, upload-time = "2026-06-29T18:52:10.803Z" },
+    { url = "https://files.pythonhosted.org/packages/d4/5f/caf3c38888dbcfb46a1da0e9b1fa8f273c3c6baf8f5accd5d11d7de967ec/responder-9.4.0-py3-none-any.whl", hash = "sha256:9796abe7edb2f63e9b06f0cdd778d463ac426e4556fc5f5b73d05806bc235799", size = 226330, upload-time = "2026-11-10T01:54:58.269Z" },
 ]
 
 [[package]]
@@ -814,7 +819,7 @@ dev = [
 requires-dist = [
     { name = "brotli" },
     { name = "granian", specifier = ">=2.0" },
-    { name = "responder", specifier = ">=7.0.0" },
+    { name = "responder", specifier = ">=9.4.0" },
 ]
 
 [package.metadata.requires-dev]
@@ -831,16 +836,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/eb/e3/7c1dc7381d9f8ab7d854328ebfa884e62cb3f3d8549ddfd37c7814f42afa/starlette-1.3.1.tar.gz", hash = "sha256:05d0213193f2fbaae60e2ecb593b4add4262ad4e46536b54abe36f11a71724e0", size = 2703240, upload-time = "2026-06-12T09:23:11.602Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/ec/bb/2799cc2ede3ed41131f8975621e7213dfc7ef4acbbaadfa440f32500c370/starlette-1.3.1-py3-none-any.whl", hash = "sha256:c7372aae11c3c3f26a42df7bd626cec2f47d03483d261d369516a615a53714c6", size = 73632, upload-time = "2026-06-12T09:23:10.017Z" },
-]
-
-[package.optional-dependencies]
-full = [
-    { name = "httpx" },
-    { name = "httpx2" },
-    { name = "itsdangerous" },
-    { name = "jinja2" },
-    { name = "python-multipart" },
-    { name = "pyyaml" },
 ]
 
 [[package]]
@@ -875,20 +870,19 @@ wheels = [
 
 [[package]]
 name = "uvicorn"
-version = "0.49.0"
+version = "0.54.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "click" },
     { name = "h11" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/c4/1f/fa18009dea8469069cca78a4e877a008ab78f08b064bfc9ab891579077ff/uvicorn-0.49.0.tar.gz", hash = "sha256:ebf4271aa580d9de97f93192d4595176df6e91f9aae919ca73e4fc07df1e66a3", size = 91284, upload-time = "2026-06-03T22:01:30.448Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/da/34/30e9280707135d2cfc589dfff3cb796bd07a3aeb1a3e415ba09dd89d7bb4/uvicorn-0.54.0.tar.gz", hash = "sha256:a2e33cbfaa0306f8e6b0c13e0cb89d7d7a2da3e62b90c66e18c33d9807b28620", size = 112283, upload-time = "2026-09-25T06:52:37.601Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/88/fa/e1388bbcf24ef3274f45c0c1c7b501fd14971037c1b6ee23610553307497/uvicorn-0.49.0-py3-none-any.whl", hash = "sha256:ba3d14c3ee7e41c6c654c46c9eb489d33213cdd30aa1696eab1374337c13f68f", size = 71376, upload-time = "2026-06-03T22:01:29.037Z" },
+    { url = "https://files.pythonhosted.org/packages/38/0c/b54a4fdd7f90a3af8b02ebc9ce6712c2c208b7926a2f7bad95c33ebbe943/uvicorn-0.54.0-py3-none-any.whl", hash = "sha256:505bdb0f318731d45f1f712071fc781a8981f6847a31c902c9f5e652d4f67faf", size = 87427, upload-time = "2026-09-25T06:52:35.829Z" },
 ]
 
 [package.optional-dependencies]
 standard = [
-    { name = "colorama", marker = "sys_platform == 'win32'" },
     { name = "httptools" },
     { name = "python-dotenv" },
     { name = "pyyaml" },

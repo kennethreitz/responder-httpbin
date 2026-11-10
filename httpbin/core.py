@@ -9,7 +9,7 @@ to the `responder <https://responder.kennethreitz.org/>`_ ASGI web framework.
 
 This is a dogfooding fork — not httpbin.org — that exercises responder end to
 end: native OpenAPI/Swagger, ASGI middleware, async streaming, templates,
-typed path params, and the built-in httpx test client.
+typed path params, the built-in httpx test client, and the MCP tool mount.
 """
 
 import asyncio
@@ -89,6 +89,23 @@ api = responder.API(
     auto_escape=False,
     gzip=False,  # /gzip /deflate /brotli encode explicitly; keep exact Content-Length
     secret_key=os.environ.get("SECRET_KEY", "responder-httpbin-not-secret"),
+)
+
+# Every route below is an MCP tool unless it passes mcp=False. A live session
+# opted these out: redirects (an unset body is negotiated as JSON ``null``, and
+# the tool result drops Location / Set-Cookie), streaming responses (a call is
+# cut off at the first await between chunks), and compressed or binary bodies
+# (the tool result is lossy text and does not honor Content-Encoding).
+api.mcp(
+    name="responder-httpbin",
+    instructions=(
+        "responder-httpbin is an HTTP request and response service. Each tool "
+        "is one route and returns that route's response body. Supply every "
+        "path argument the schema marks required. Echo routes do not declare a "
+        "query string, request headers, or a JSON body, so they describe the "
+        "request the tool call itself made. Streaming, redirect, compressed, "
+        "and binary routes are not published."
+    ),
 )
 
 
@@ -177,6 +194,38 @@ api.add_middleware(HttpbinMiddleware)
 _ROUTE_PATTERNS = {}
 
 
+def _prose_doc(handler):
+    """Docstring prose, without the trailing OpenAPI YAML block."""
+    doc = handler.__doc__ or ""
+    return doc.split("\n---", 1)[0].strip() or None
+
+
+def _documented_response(model):
+    """Keep ``model`` in the OpenAPI document without enforcing it at runtime.
+
+    Responder 9 treats ``response_model=`` as a contract and requires the
+    handler to assign ``resp.media``. These handlers write the exact httpbin
+    body themselves — pretty-printed JSON, a compressed payload, or a stream —
+    and that contract turns the response into a 500. The schema stays; the
+    route opts out of enforcement.
+    """
+    api.openapi.add_schema(model.__name__, model, check_existing=False)
+    return {
+        "responses": {
+            "200": {
+                "description": "Successful response",
+                "content": {
+                    "application/json": {
+                        "schema": {
+                            "$ref": f"#/components/schemas/{model.__name__}"
+                        }
+                    }
+                },
+            }
+        }
+    }
+
+
 def route(
     pattern,
     methods=None,
@@ -185,25 +234,37 @@ def route(
     include_in_schema=True,
     response_model=None,
     params_model=None,
+    mcp=None,
 ):
     """Register a responder route and remember its pattern for ``url_for``.
 
     Delegates to ``api.route`` so responder's pydantic schema features
-    (``response_model`` / ``params_model``) and OpenAPI registration apply.
+    (``params_model``) and OpenAPI registration apply.
     ``include_in_schema=False`` keeps the route working but
     hides it from the schema/Swagger UI, matching httpbin.org (which documents 52
     endpoints but still serves a few undocumented helper routes).
+    ``mcp=False`` keeps the route on HTTP but out of the ``/mcp`` tool list.
+    A ``response_model`` is published on the schema only; see
+    :func:`_documented_response`.
     """
 
     def decorator(handler):
         endpoint = name or handler.__name__
         _ROUTE_PATTERNS.setdefault(endpoint, pattern)
+        openapi_extra = None
+        runtime_model = response_model
+        if response_model not in (None, False):
+            openapi_extra = _documented_response(response_model)
+            runtime_model = False
         handler = api.route(
             pattern,
             methods=methods,
             include_in_schema=include_in_schema,
-            response_model=response_model,
+            response_model=runtime_model,
             params_model=params_model,
+            openapi_extra=openapi_extra,
+            description=_prose_doc(handler),
+            mcp=mcp,
         )(handler)
         for extra in extra_patterns:
             api.add_route(extra, handler, methods=methods)
@@ -480,7 +541,7 @@ async def view_delete(req, resp):
     )
 
 
-@route("/gzip", methods=["GET"], response_model=models.EncodedResponse)
+@route("/gzip", methods=["GET"], response_model=models.EncodedResponse, mcp=False)
 async def view_gzip_encoded_content(req, resp):
     """Returns GZip-encoded data.
     ---
@@ -496,7 +557,7 @@ async def view_gzip_encoded_content(req, resp):
     resp.headers["Content-Length"] = str(len(resp.content))
 
 
-@route("/deflate", methods=["GET"], response_model=models.EncodedResponse)
+@route("/deflate", methods=["GET"], response_model=models.EncodedResponse, mcp=False)
 async def view_deflate_encoded_content(req, resp):
     """Returns Deflate-encoded data.
     ---
@@ -512,7 +573,7 @@ async def view_deflate_encoded_content(req, resp):
     resp.headers["Content-Length"] = str(len(resp.content))
 
 
-@route("/brotli", methods=["GET"], response_model=models.EncodedResponse)
+@route("/brotli", methods=["GET"], response_model=models.EncodedResponse, mcp=False)
 async def view_brotli_encoded_content(req, resp):
     """Returns Brotli-encoded data.
     ---
@@ -534,7 +595,7 @@ async def view_brotli_encoded_content(req, resp):
     resp.headers["Content-Length"] = str(len(resp.content))
 
 
-@route("/redirect/{n:int}", methods=["GET"])
+@route("/redirect/{n:int}", methods=["GET"], mcp=False)
 def redirect_n_times(req, resp, *, n):
     """302 Redirects n times.
     ---
@@ -547,6 +608,9 @@ def redirect_n_times(req, resp, *, n):
     absolute = req.params.get("absolute", "false").lower() == "true"
 
     resp.status_code = 302
+    # An unset body is content-negotiated. With no Accept header that becomes
+    # JSON ``null``; httpbin redirects have an empty body.
+    resp.content = b""
     if n == 1:
         resp.headers["Location"] = (host_url(req) + "/get") if absolute else "/get"
         return
@@ -559,7 +623,7 @@ def redirect_n_times(req, resp, *, n):
         resp.headers["Location"] = url_for("relative_redirect_n_times", n=n - 1)
 
 
-@route("/redirect-to", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "TRACE"])
+@route("/redirect-to", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "TRACE"], mcp=False)
 def redirect_to(req, resp):
     """302/3XX Redirects to the given URL.
     ---
@@ -574,6 +638,7 @@ def redirect_to(req, resp):
     args = {key.lower(): value for key, value in query_pairs(req)}
 
     resp.status_code = 302
+    resp.content = b""
     status_code = args.get("status_code")
     if status_code is not None:
         code = int(status_code)
@@ -585,7 +650,7 @@ def redirect_to(req, resp):
     resp.headers["Location"] = args["url"].encode("utf-8").decode("latin-1")
 
 
-@route("/relative-redirect/{n:int}", methods=["GET"])
+@route("/relative-redirect/{n:int}", methods=["GET"], mcp=False)
 def relative_redirect_n_times(req, resp, *, n):
     """Relatively 302 Redirects n times.
     ---
@@ -595,13 +660,14 @@ def relative_redirect_n_times(req, resp, *, n):
     """
     assert n > 0
     resp.status_code = 302
+    resp.content = b""
     if n == 1:
         resp.headers["Location"] = "/get"
         return
     resp.headers["Location"] = url_for("relative_redirect_n_times", n=n - 1)
 
 
-@route("/absolute-redirect/{n:int}", methods=["GET"])
+@route("/absolute-redirect/{n:int}", methods=["GET"], mcp=False)
 def absolute_redirect_n_times(req, resp, *, n):
     """Absolutely 302 Redirects n times.
     ---
@@ -611,6 +677,7 @@ def absolute_redirect_n_times(req, resp, *, n):
     """
     assert n > 0
     resp.status_code = 302
+    resp.content = b""
     if n == 1:
         resp.headers["Location"] = host_url(req) + "/get"
         return
@@ -619,7 +686,7 @@ def absolute_redirect_n_times(req, resp, *, n):
     )
 
 
-@route("/stream/{n:int}", methods=["GET"], response_model=models.StreamResponse)
+@route("/stream/{n:int}", methods=["GET"], response_model=models.StreamResponse, mcp=False)
 async def stream_n_messages(req, resp, *, n):
     """Stream n JSON responses.
     ---
@@ -741,7 +808,7 @@ def view_forms_post(req, resp):
     resp.html = text_resource("forms-post.html")
 
 
-@route("/cookies/set/{name}/{value}", methods=["GET"])
+@route("/cookies/set/{name}/{value}", methods=["GET"], mcp=False)
 def set_cookie(req, resp, *, name, value):
     """Sets a cookie and redirects to the cookie list.
     ---
@@ -750,11 +817,12 @@ def set_cookie(req, resp, *, name, value):
         summary: Sets a cookie and redirects to the cookie list.
     """
     resp.status_code = 302
+    resp.content = b""
     resp.headers["Location"] = url_for("view_cookies")
     _set_cookie(resp, name, value=value, secure=secure_cookie(req))
 
 
-@route("/cookies/set", methods=["GET"])
+@route("/cookies/set", methods=["GET"], mcp=False)
 def set_cookies(req, resp):
     """Sets cookie(s) as provided by the query string and redirects to cookie list.
     ---
@@ -763,12 +831,13 @@ def set_cookies(req, resp):
         summary: Sets cookies from the query string and redirects to the cookie list.
     """
     resp.status_code = 302
+    resp.content = b""
     resp.headers["Location"] = url_for("view_cookies")
     for key, value in query_pairs(req):
         _set_cookie(resp, key, value=value, secure=secure_cookie(req))
 
 
-@route("/cookies/delete", methods=["GET"])
+@route("/cookies/delete", methods=["GET"], mcp=False)
 def delete_cookies(req, resp):
     """Deletes cookie(s) as provided by the query string and redirects to cookie list.
     ---
@@ -777,6 +846,7 @@ def delete_cookies(req, resp):
         summary: Deletes cookies named in the query string and redirects to the cookie list.
     """
     resp.status_code = 302
+    resp.content = b""
     resp.headers["Location"] = url_for("view_cookies")
     for key, _value in query_pairs(req):
         _set_cookie(
@@ -959,7 +1029,7 @@ async def delay_response(req, resp, *, delay):
     )
 
 
-@route("/drip", methods=["GET"])
+@route("/drip", methods=["GET"], mcp=False)
 async def drip(
     req,
     resp,
@@ -1085,7 +1155,7 @@ def encoding(req, resp):
     resp.mimetype = "text/html; charset=utf-8"
 
 
-@route("/bytes/{n:int}", methods=["GET"])
+@route("/bytes/{n:int}", methods=["GET"], mcp=False)
 def random_bytes(req, resp, *, n, seed: int = Query(None, description="RNG seed.")):
     """Returns n random bytes generated with given seed.
     ---
@@ -1102,7 +1172,7 @@ def random_bytes(req, resp, *, n, seed: int = Query(None, description="RNG seed.
     resp.mimetype = "application/octet-stream"
 
 
-@route("/stream-bytes/{n:int}", methods=["GET"])
+@route("/stream-bytes/{n:int}", methods=["GET"], mcp=False)
 async def stream_random_bytes(
     req,
     resp,
@@ -1138,7 +1208,7 @@ async def stream_random_bytes(
             yield bytes(chunks)
 
 
-@route("/range/{numbytes:int}", methods=["GET"])
+@route("/range/{numbytes:int}", methods=["GET"], mcp=False)
 async def range_request(
     req,
     resp,
@@ -1230,14 +1300,15 @@ def link_page(req, resp, *, n, offset):
     resp.html = "".join(html)
 
 
-@route("/links/{n:int}", methods=["GET"], include_in_schema=False)
+@route("/links/{n:int}", methods=["GET"], include_in_schema=False, mcp=False)
 def links(req, resp, *, n):
     """Redirect to first links page."""
     resp.status_code = 302
+    resp.content = b""
     resp.headers["Location"] = url_for("link_page", n=n, offset=0)
 
 
-@route("/image", methods=["GET"])
+@route("/image", methods=["GET"], mcp=False)
 def image(req, resp):
     """Returns a simple image of the type suggested by the Accept header.
     ---
@@ -1268,7 +1339,7 @@ def _serve_image(resp, filename, content_type):
     resp.mimetype = content_type
 
 
-@route("/image/png", methods=["GET"])
+@route("/image/png", methods=["GET"], mcp=False)
 def image_png(req, resp):
     """Returns a simple PNG image.
     ---
@@ -1279,7 +1350,7 @@ def image_png(req, resp):
     _serve_image(resp, "images/pig_icon.png", "image/png")
 
 
-@route("/image/jpeg", methods=["GET"])
+@route("/image/jpeg", methods=["GET"], mcp=False)
 def image_jpeg(req, resp):
     """Returns a simple JPEG image.
     ---
@@ -1290,7 +1361,7 @@ def image_jpeg(req, resp):
     _serve_image(resp, "images/jackal.jpg", "image/jpeg")
 
 
-@route("/image/webp", methods=["GET"])
+@route("/image/webp", methods=["GET"], mcp=False)
 def image_webp(req, resp):
     """Returns a simple WEBP image.
     ---

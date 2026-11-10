@@ -825,5 +825,100 @@ class HttpbinTestCase(unittest.TestCase):
         self.assertEqual(parse_multi_value_header('*'), ["*"])
 
 
+class McpTestCase(unittest.TestCase):
+    """The /mcp mount publishes routes as tools."""
+
+    def setUp(self):
+        self.app = TestClient(httpbin.api, base_url="http://localhost")
+
+    def rpc(self, method, params=None, rpc_id=1):
+        payload = {"jsonrpc": "2.0", "id": rpc_id, "method": method}
+        if params is not None:
+            payload["params"] = params
+        response = self.app.post("/mcp", json=payload)
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual(body["id"], rpc_id)
+        return body
+
+    def test_initialize_and_published_tools(self):
+        result = self.rpc(
+            "initialize",
+            {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "test", "version": "0"},
+            },
+        )["result"]
+        self.assertEqual(result["serverInfo"]["name"], "responder-httpbin")
+        self.assertEqual(result["protocolVersion"], "2025-06-18")
+
+        names = {
+            tool["name"]
+            for tool in self.rpc("tools/list", rpc_id=2)["result"]["tools"]
+        }
+        self.assertEqual(len(names), 56)
+        self.assertTrue(
+            {"view_get", "view_post", "view_headers", "view_status_code"} <= names
+        )
+        self.assertTrue(
+            names.isdisjoint(
+                {
+                    "redirect_n_times",
+                    "redirect_to",
+                    "stream_n_messages",
+                    "drip",
+                    "random_bytes",
+                    "stream_random_bytes",
+                    "range_request",
+                    "view_gzip_encoded_content",
+                    "view_deflate_encoded_content",
+                    "view_brotli_encoded_content",
+                    "image",
+                    "image_png",
+                    "image_jpeg",
+                    "image_webp",
+                    "set_cookie",
+                    "set_cookies",
+                    "delete_cookies",
+                    "links",
+                }
+            )
+        )
+
+    def test_representative_tool_calls(self):
+        got = self.rpc(
+            "tools/call", {"name": "view_get", "arguments": {}}, rpc_id=3
+        )["result"]
+        self.assertIs(got["isError"], False)
+        self.assertIn("/get", got["structuredContent"]["url"])
+
+        # Echo routes have no declared body, so a JSON object passed as tool
+        # arguments is not the request body.
+        posted = self.rpc(
+            "tools/call",
+            {"name": "view_post", "arguments": {"hello": "world"}},
+            rpc_id=4,
+        )["result"]
+        self.assertIs(posted["isError"], False)
+        self.assertIsNone(posted["structuredContent"]["json"])
+        self.assertEqual(posted["structuredContent"]["args"], {})
+
+        missing = self.rpc(
+            "tools/call",
+            {"name": "view_status_code", "arguments": {"codes": "404"}},
+            rpc_id=5,
+        )["result"]
+        self.assertIs(missing["isError"], True)
+        self.assertIn("404", missing["content"][0]["text"])
+
+        teapot = self.rpc(
+            "tools/call",
+            {"name": "view_status_code", "arguments": {"codes": "418"}},
+            rpc_id=6,
+        )["result"]
+        self.assertIn("teapot", teapot["content"][0]["text"])
+
+
 if __name__ == '__main__':
     unittest.main()
